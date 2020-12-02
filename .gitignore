@@ -13,3 +13,11 @@
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
+#
+# build artifacts
+*.o
+#vi
+*~
+*.swp
+*.swo
+
