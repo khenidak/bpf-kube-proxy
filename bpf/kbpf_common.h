@@ -380,13 +380,13 @@ static inline int get_service_by_service_ip(struct kbpf_ip *ip, struct kbpf_serv
 
 // a packet going to an service.ip:port .. find an endpoint port
 static inline int get_backend_port_by_service_port(struct kbpf_service *service, __be16 dest_port, __u8 l4_proto, __be16 **endpoint_port) {
-    struct kbpf_service_port service_port_key = {0};
-    service_port_key.key       = service->key;
-    service_port_key.dest_port = dest_port;
-    service_port_key.l4_proto  = l4_proto;
+    struct kbpf_port_key port_key = {0};
+    port_key.key       = service->key;
+    port_key.port = dest_port;
+    port_key.l4_proto  = l4_proto;
 
 
-    __be16 *port = bpf_map_lookup_elem((uint64_t) &service_port_to_backend_port, &service_port_key);
+    __be16 *port = bpf_map_lookup_elem((uint64_t) &service_port_to_backend_port, &port_key);
     if (port == NULL) return -1;
 
     *endpoint_port = port;
@@ -395,14 +395,14 @@ static inline int get_backend_port_by_service_port(struct kbpf_service *service,
 
 // a packet coming from a pod
 static inline int get_service_port_by_backend_port(struct kbpf_service *service, __be16 src_port, __u8 l4_proto, __be16 **out_port) {
-    struct kbpf_service_port service_port_key = {0};
+    struct kbpf_port_key port_key = {0};
 
-    service_port_key.key       = service->key;
-    service_port_key.dest_port = src_port;
-    service_port_key.l4_proto  = l4_proto;
+    port_key.key       = service->key;
+    port_key.port = src_port;
+    port_key.l4_proto  = l4_proto;
 
 
-    __be16 *port = bpf_map_lookup_elem((uint64_t) &backend_port_to_service_port, &service_port_key);
+    __be16 *port = bpf_map_lookup_elem((uint64_t) &backend_port_to_service_port, &port_key);
     if (port == NULL) return -1;
 
     *out_port = port;

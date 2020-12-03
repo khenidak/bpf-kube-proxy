@@ -78,9 +78,9 @@ struct kbpf_service_backend_key {
    __u64 index; // index of this endpoint
 };
 
-struct kbpf_service_port {
+struct kbpf_port_key {
     kbpf_service_key key;
-    __be16 dest_port;
+    __be16 port;
     __u8 l4_proto;
 };
 
@@ -144,7 +144,7 @@ struct bpf_map_def SEC("maps") service_ips = {
 // map: maps  {service port : pod port}
 struct bpf_map_def SEC("maps") service_port_to_backend_port = {
     .type = BPF_MAP_TYPE_HASH,
-    .key_size = sizeof(struct kbpf_service_port),
+    .key_size = sizeof(struct kbpf_port_key),
     .value_size = sizeof(__be16),
     .max_entries = MAX_SERVICE_COUNT * MAX_PORTS_PER_SERVICE,
 		.pinning = PIN_GLOBAL_NS,
@@ -153,7 +153,7 @@ struct bpf_map_def SEC("maps") service_port_to_backend_port = {
 // map: maps {pod port: service port}
 struct bpf_map_def SEC("maps") backend_port_to_service_port = {
     .type = BPF_MAP_TYPE_HASH,
-    .key_size = sizeof(struct kbpf_service_port),
+    .key_size = sizeof(struct kbpf_port_key),
     .value_size = sizeof(__be16),
     .max_entries = MAX_SERVICE_COUNT * MAX_PORTS_PER_SERVICE,
 		.pinning = PIN_GLOBAL_NS,
