@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"net"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -223,5 +224,114 @@ func comparePortMaps(t *testing.T, expected, saved map[uint8]map[uint16]uint16) 
 			}
 		}
 	}
+}
 
+func TestIPRoundTripper(t *testing.T) {
+	testData := []net.IP{
+		net.ParseIP("1.2.3.4"),
+		net.ParseIP("172.16.0.1"),
+		net.ParseIP("10.0.0.11"),
+		net.ParseIP("172.16.0.2"),
+		net.ParseIP("2000::1"),
+		net.ParseIP("2000::2"),
+		net.ParseIP("2000::3"),
+		net.ParseIP("2000::4"),
+	}
+
+	for _, ip := range testData {
+		kbpfIP := *(ipToKbpfIP(ip))
+		gotIP := kbpfIPToIP(&kbpfIP)
+
+		if gotIP.String() != ip.String() {
+			t.Fatalf("expected ip after round trip:%v got %v", ip, gotIP)
+		}
+	}
+}
+
+func TestServiceIPs(t *testing.T) {
+	//	assert := assert.New(t)
+	serviceName := "namespace/service"
+
+	tracked := &trackedService{
+		namespaceName:  serviceName,
+		affinitySec:    10,
+		totalEndpoints: 10,
+		bpfId:          123456,
+	}
+
+	testData := []net.IP{
+		net.ParseIP("1.2.3.4"),
+		net.ParseIP("172.16.0.1"),
+		net.ParseIP("10.0.0.11"),
+		net.ParseIP("172.16.0.2"),
+		net.ParseIP("2000::1"),
+		net.ParseIP("2000::2"),
+		net.ParseIP("2000::3"),
+		net.ParseIP("2000::4"),
+	}
+
+	ipsToDelete := []net.IP{
+		net.ParseIP("172.16.0.2"),
+		net.ParseIP("2000::1"),
+	}
+	// insertion test
+	for _, ip := range testData {
+		err := bpfInsertOrUpdateServiceIP(tracked.bpfId, ip)
+		if err != nil {
+			t.Fatalf("failed to insert service ip:%v with error:%v", ip, err)
+		}
+	}
+
+	// read them
+	savedServiceIPs, err := bpfGetServiceIPs(tracked.bpfId)
+	if err != nil {
+		t.Fatalf("failed to get service IPs with error:%v", err)
+	}
+
+	compareIPList(t, testData, savedServiceIPs)
+
+	// test delete function
+	filtered := make([]net.IP, 0, len(testData)-len(ipsToDelete))
+	for _, currentIP := range testData {
+		add := true
+		for _, toDeleteIP := range ipsToDelete {
+			if currentIP.String() == toDeleteIP.String() {
+				err := bpfDeleteServiceIP(tracked.bpfId, toDeleteIP)
+				if err != nil {
+					t.Fatalf("failed to delete ip:%v with err:%v", toDeleteIP, err)
+				}
+				add = false
+			}
+		}
+		if add {
+			filtered = append(filtered, currentIP)
+		}
+
+	}
+	// get and recompare
+	savedServiceIPs, err = bpfGetServiceIPs(tracked.bpfId)
+	if err != nil {
+		t.Fatalf("failed to get service IPs with error:%v", err)
+	}
+
+	compareIPList(t, filtered, savedServiceIPs)
+}
+
+func compareIPList(t *testing.T, expected []net.IP, got []net.IP) {
+	if len(expected) != len(got) {
+		t.Fatalf("count of ips:%v does not equal expected:%v gotIPs:%v", len(got), len(expected), got)
+	}
+
+	for _, expectedIP := range expected {
+		found := false
+		for _, gotIP := range got {
+			if expectedIP.String() == gotIP.String() {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("couldn't find IP:%v in %v", expectedIP, got)
+		}
+	}
 }

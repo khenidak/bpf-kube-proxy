@@ -66,7 +66,7 @@ struct affinity {
 
 struct kbpf_service {
 		kbpf_service_key key;
-    // total # of pods (IMPORTANT: count of pods, not count IPs of pods)
+    // total # of backends (IMPORTANT: count of backend, not count IPs of backend)
     __u16 total_endpoints;
     // service has affinity or not
     __u16 has_affinity;
@@ -123,7 +123,7 @@ struct bpf_map_def SEC("maps") services = {
     .max_entries = MAX_SERVICE_COUNT,
 		.pinning = PIN_GLOBAL_NS,
 };
-
+// map: {service backend key (id, l2_proto, index) : ip
 struct bpf_map_def SEC("maps") service_backends = {
     .type = BPF_MAP_TYPE_HASH,
     .key_size = sizeof(struct kbpf_service_backend_key),
