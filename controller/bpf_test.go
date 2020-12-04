@@ -317,6 +317,75 @@ func TestServiceIPs(t *testing.T) {
 	compareIPList(t, filtered, savedServiceIPs)
 }
 
+func TestBackendIPs(t *testing.T) {
+	//	assert := assert.New(t)
+	serviceName := "namespace/service"
+
+	tracked := &trackedService{
+		namespaceName:  serviceName,
+		affinitySec:    10,
+		totalEndpoints: 10,
+		bpfId:          123456,
+	}
+
+	testData := []net.IP{
+		net.ParseIP("1.2.3.4"),
+		net.ParseIP("172.16.0.1"),
+		net.ParseIP("10.0.0.11"),
+		net.ParseIP("172.16.0.2"),
+		net.ParseIP("2000::1"),
+		net.ParseIP("2000::2"),
+		net.ParseIP("2000::3"),
+		net.ParseIP("2000::4"),
+	}
+
+	ipsToDelete := []net.IP{
+		net.ParseIP("172.16.0.2"),
+		net.ParseIP("2000::1"),
+	}
+	// insertion test
+	for _, ip := range testData {
+		err := bpfInsertOrUpdateBackendToService(tracked.bpfId, ip)
+		if err != nil {
+			t.Fatalf("failed to insert service ip:%v with error:%v", ip, err)
+		}
+	}
+
+	// read them
+	savedBackendIPs, err := bpfGetBackendsToService(tracked.bpfId)
+	if err != nil {
+		t.Fatalf("failed to get service IPs with error:%v", err)
+	}
+
+	compareIPList(t, testData, savedBackendIPs)
+
+	// test delete function
+	filtered := make([]net.IP, 0, len(testData)-len(ipsToDelete))
+	for _, currentIP := range testData {
+		add := true
+		for _, toDeleteIP := range ipsToDelete {
+			if currentIP.String() == toDeleteIP.String() {
+				err := bpfDeleteBackendToService(tracked.bpfId, toDeleteIP)
+				if err != nil {
+					t.Fatalf("failed to delete ip:%v with err:%v", toDeleteIP, err)
+				}
+				add = false
+			}
+		}
+		if add {
+			filtered = append(filtered, currentIP)
+		}
+
+	}
+	// get and recompare
+	savedBackendIPs, err = bpfGetBackendsToService(tracked.bpfId)
+	if err != nil {
+		t.Fatalf("failed to get service IPs with error:%v", err)
+	}
+
+	compareIPList(t, filtered, savedBackendIPs)
+}
+
 func compareIPList(t *testing.T, expected []net.IP, got []net.IP) {
 	if len(expected) != len(got) {
 		t.Fatalf("count of ips:%v does not equal expected:%v gotIPs:%v", len(got), len(expected), got)

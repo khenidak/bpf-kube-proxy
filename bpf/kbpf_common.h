@@ -367,7 +367,7 @@ static inline int skb_snat(struct __sk_buff *skb, __u8 l4_proto, struct kbpf_ip 
 // state management
 static inline int get_service_by_service_ip(struct kbpf_ip *ip, struct kbpf_service **service) {
     // get service key for that service ip
-    kbpf_service_key *key  = bpf_map_lookup_elem((uint64_t) &endpoints_service_key, ip);
+    kbpf_service_key *key  = bpf_map_lookup_elem((uint64_t) &backend_service, ip);
     if (key == NULL) return -1;
 
     // get service details for that key

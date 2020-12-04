@@ -160,7 +160,7 @@ struct bpf_map_def SEC("maps") backend_port_to_service_port = {
 };
 
 // map: maps a {endpoint (IP): service}
-struct bpf_map_def SEC("maps") endpoints_service_key = {
+struct bpf_map_def SEC("maps") backend_service = {
     .type = BPF_MAP_TYPE_HASH,
     .key_size = sizeof(struct kbpf_ip),
     .value_size = sizeof(kbpf_service_key),
