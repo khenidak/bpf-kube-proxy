@@ -471,7 +471,7 @@ static inline int load_balance(struct kbpf_service *service, __u8 l4_proto, stru
     backend_key.index = idx; // index of this endpoint
     backend_key.l2_proto = src_ip->l2_proto;
 
-    struct kbpf_ip *target_ip = bpf_map_lookup_elem((uint64_t) &service_backends, &backend_key);
+    struct kbpf_ip *target_ip = bpf_map_lookup_elem((uint64_t) &service_backends_indexed, &backend_key);
     if(target_ip == NULL) return -1;
     *new_ip = target_ip;
 

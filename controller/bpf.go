@@ -34,6 +34,36 @@ struct kbpf_ip {
     uint16_t l2_proto;
 };
 
+struct kbpf_service_backend_key {
+   kbpf_service_key key;
+   uint16_t l2_proto;
+   uint64_t index; // index of this endpoint
+};
+
+struct kbpf_flow_key {
+    kbpf_service_key key;
+    // client ip
+    struct kbpf_ip src_ip;
+    uint16_t src_port;
+    uint8_t l4_proto;
+};
+
+struct  kbpf_flow {
+    struct kbpf_ip dest_ip;
+    uint64_t hit;
+};
+
+struct affinity_key {
+    struct kbpf_ip client_ip; //client ip
+    kbpf_service_key service; // target service
+};
+
+struct affinity {
+    struct kbpf_ip ip; // backend ip
+    uint64_t hit;
+};
+
+
 //hton-ed eth l2 protos
 #define ETH_PROTO_IP 8
 #define ETH_PROTO_IPV6 56710
@@ -69,6 +99,9 @@ const map_path_service_port_to_backend_port = "/sys/fs/bpf/tc/globals/service_po
 const map_path_backend_port_to_service_port = "/sys/fs/bpf/tc/globals/backend_port_to_service_port"
 const map_path_service_ips_to_service = "/sys/fs/bpf/tc/globals/service_ips"
 const map_path_backend_service = "/sys/fs/bpf/tc/globals/backend_service"
+const map_path_service_backend_indexed = "/sys/fs/bpf/tc/globals/service_backends_indexed"
+const map_path_flow = "/sys/fs/bpf/tc/globals/flows"
+const map_path_affinity = "/sys/fs/bpf/tc/globals/affinity"
 
 var bpfMaps map[string]*goebpf.EbpfMap
 var bpfMapMu sync.Mutex
@@ -103,8 +136,310 @@ func bpfGetMap(p string) (*goebpf.EbpfMap, error) {
 	}
 
 	bpfMaps[p] = m
-
 	return m, nil
+}
+
+// this function is used only for testing
+func bpfInsertOrUpdateAffinity(bpfId uint64, clientIP net.IP, destIP net.IP, hit uint64) error {
+	mapAffinity, err := bpfGetMap(map_path_affinity)
+	if err != nil {
+		return err
+	}
+
+	srcKbpfIP := *(ipToKbpfIP(clientIP))
+	dstKbpfIP := *(ipToKbpfIP(destIP))
+
+	affinityKey := C.struct_affinity_key{}
+	affinityKey.client_ip = srcKbpfIP
+	affinityKey.service = C.ulong(bpfId)
+
+	affinityData := C.struct_affinity{}
+	affinityData.ip = dstKbpfIP
+	affinityData.hit = C.ulong(hit)
+
+	keyBuff := make([]byte, C.sizeof_struct_affinity_key, C.sizeof_struct_affinity_key)
+	C.memcpy(unsafe.Pointer(&keyBuff[0]), unsafe.Pointer(&affinityKey), C.sizeof_struct_affinity_key)
+
+	dataBuff := make([]byte, C.sizeof_struct_affinity, C.sizeof_struct_affinity)
+	C.memcpy(unsafe.Pointer(&dataBuff[0]), unsafe.Pointer(&affinityData), C.sizeof_struct_affinity)
+
+	return mapAffinity.Upsert(keyBuff, dataBuff)
+}
+
+type affinity struct {
+	clientIP net.IP
+	destIP   net.IP
+	hit      uint64
+}
+
+func bpfGetAffinityForService(bpfId uint64) ([]affinity, error) {
+	all, err := bpfGetAllAffinities()
+	if err != nil {
+		return nil, err
+	}
+
+	return all[bpfId], nil
+}
+
+func bpfGetAllAffinities() (map[uint64][]affinity, error) {
+	all := make(map[uint64][]affinity)
+	mapAffinity, err := bpfGetMap(map_path_affinity)
+	if err != nil {
+		return nil, err
+	}
+
+	buff := make([]byte, C.sizeof_struct_affinity_key, C.sizeof_struct_affinity_key)
+	C.memset(unsafe.Pointer(&buff[0]), 0, C.sizeof_struct_affinity_key)
+
+	for {
+		buff, err = mapAffinity.GetNextKey(buff)
+		if err != nil {
+			return all, nil // error is returned when last key is read. // TODO find a better way
+		}
+		if len(buff) == 0 {
+			return all, nil
+		}
+
+		affinityKey := *(*C.struct_affinity_key)(unsafe.Pointer(&buff[0]))
+
+		affiniyDataBuff, err := mapAffinity.Lookup(buff)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(affiniyDataBuff) == 0 {
+			continue
+		}
+
+		affinityData := *(*C.struct_affinity)(unsafe.Pointer(&affiniyDataBuff[0]))
+
+		var aff affinity
+		aff.clientIP = kbpfIPToIP(&affinityKey.client_ip)
+		aff.destIP = kbpfIPToIP(&affinityData.ip)
+		aff.hit = uint64(affinityData.hit)
+		if all[uint64(affinityKey.service)] == nil {
+			all[uint64(affinityKey.service)] = make([]affinity, 0)
+		}
+		all[uint64(affinityKey.service)] = append(all[uint64(affinityKey.service)], aff)
+	}
+
+	return all, nil
+}
+
+func bpfDeleteAffinity(bpfId uint64, clientIP net.IP) error {
+	mapAffinity, err := bpfGetMap(map_path_affinity)
+	if err != nil {
+		return err
+	}
+
+	clientKbpfIP := *(ipToKbpfIP(clientIP))
+
+	affinityKey := C.struct_affinity_key{}
+	affinityKey.client_ip = clientKbpfIP
+	affinityKey.service = C.ulong(bpfId)
+
+	keyBuff := make([]byte, C.sizeof_struct_affinity_key, C.sizeof_struct_affinity_key)
+	C.memcpy(unsafe.Pointer(&keyBuff[0]), unsafe.Pointer(&affinityKey), C.sizeof_struct_affinity_key)
+
+	return mapAffinity.Delete(keyBuff)
+}
+
+// This function is used only for testing
+func bpfInsertOrUpdateFlow(bpfId uint64, srcIP net.IP, srcPort uint16, l4_proto uint8, destIP net.IP, hit uint64) error {
+	mapFlows, err := bpfGetMap(map_path_flow)
+	if err != nil {
+		return err
+	}
+
+	srcKbpfIP := *(ipToKbpfIP(srcIP))
+	dstKbpfIP := *(ipToKbpfIP(destIP))
+	flowKey := C.struct_kbpf_flow_key{}
+	flowKey.key = C.ulong(bpfId)
+	flowKey.src_ip = srcKbpfIP
+	flowKey.l4_proto = C.uchar(C.htons(C.ushort(l4_proto)) >> 8)
+	flowKey.src_port = C.htons(C.ushort(srcPort))
+
+	keyBuff := make([]byte, C.sizeof_struct_kbpf_flow_key, C.sizeof_struct_kbpf_flow_key)
+	C.memcpy(unsafe.Pointer(&keyBuff[0]), unsafe.Pointer(&flowKey), C.sizeof_struct_kbpf_flow_key)
+
+	flowData := C.struct_kbpf_flow{}
+	flowData.dest_ip = dstKbpfIP
+	flowData.hit = C.ulong(hit)
+
+	dataBuff := make([]byte, C.sizeof_struct_kbpf_flow, C.sizeof_struct_kbpf_flow)
+	C.memcpy(unsafe.Pointer(&dataBuff[0]), unsafe.Pointer(&flowData), C.sizeof_struct_kbpf_flow)
+
+	return mapFlows.Upsert(keyBuff, dataBuff)
+}
+
+type flow struct {
+	srcIP    net.IP
+	srcPort  uint16
+	l4_proto uint8
+	destIP   net.IP
+	hit      uint64
+}
+
+func bpfGetFlowsForService(bpfId uint64) ([]flow, error) {
+	all, err := bpfGetAllFlows()
+	if err != nil {
+		return nil, err
+	}
+
+	return all[bpfId], nil
+}
+func bpfGetAllFlows() (map[uint64][]flow, error) {
+	all := make(map[uint64][]flow)
+	mapFlows, err := bpfGetMap(map_path_flow)
+	if err != nil {
+		return nil, err
+	}
+
+	buff := make([]byte, C.sizeof_struct_kbpf_flow_key, C.sizeof_struct_kbpf_flow_key)
+	C.memset(unsafe.Pointer(&buff[0]), 0, C.sizeof_struct_kbpf_service_backend_key)
+
+	for {
+		buff, err = mapFlows.GetNextKey(buff)
+		if err != nil {
+			return all, nil // error is returned when last key is read. // TODO find a better way
+		}
+		if len(buff) == 0 {
+			return all, nil
+		}
+
+		flowKey := *(*C.struct_kbpf_flow_key)(unsafe.Pointer(&buff[0]))
+
+		newFlow := flow{}
+		newFlow.srcIP = kbpfIPToIP(&flowKey.src_ip)
+		newFlow.l4_proto = uint8(C.ntohs(C.ushort(flowKey.l4_proto) << 8))
+		newFlow.srcPort = uint16(C.ntohs(C.ushort(flowKey.src_port)))
+
+		flowDataBuff, err := mapFlows.Lookup(buff)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(flowDataBuff) == 0 {
+			continue
+		}
+
+		flowData := *(*C.struct_kbpf_flow)(unsafe.Pointer(&flowDataBuff[0]))
+
+		thisIP := kbpfIPToIP(&flowData.dest_ip)
+		newFlow.destIP = thisIP
+		newFlow.hit = uint64(flowData.hit)
+		if all[uint64(flowKey.key)] == nil {
+			all[uint64(flowKey.key)] = make([]flow, 0)
+		}
+		all[uint64(flowKey.key)] = append(all[uint64(flowKey.key)], newFlow)
+
+	}
+
+	return all, nil
+}
+
+func bpfDeleteFlow(bpfId uint64, srcIP net.IP, srcPort uint16, l4_proto uint8) error {
+	mapFlows, err := bpfGetMap(map_path_flow)
+	if err != nil {
+		return err
+	}
+
+	srcKbpfIP := *(ipToKbpfIP(srcIP))
+	flowKey := C.struct_kbpf_flow_key{}
+	flowKey.key = C.ulong(bpfId)
+	flowKey.src_ip = srcKbpfIP
+	flowKey.l4_proto = C.uchar(C.htons(C.ushort(l4_proto)) >> 8)
+	flowKey.src_port = C.htons(C.ushort(srcPort))
+
+	keyBuff := make([]byte, C.sizeof_struct_kbpf_flow_key, C.sizeof_struct_kbpf_flow_key)
+	C.memcpy(unsafe.Pointer(&keyBuff[0]), unsafe.Pointer(&flowKey), C.sizeof_struct_kbpf_flow_key)
+
+	return mapFlows.Delete(keyBuff)
+}
+
+func bpfInsertOrUpdateServiceToBackendIndexed(bpfId uint64, index uint64, ip net.IP) error {
+	mapServiceBackendIndexed, err := bpfGetMap(map_path_service_backend_indexed)
+	if err != nil {
+		return err
+	}
+
+	kbpfIP := *(ipToKbpfIP(ip))
+	backendKey := C.struct_kbpf_service_backend_key{}
+	if isIPv6(ip) {
+		backendKey.l2_proto = C.ETH_PROTO_IP
+	} else {
+		backendKey.l2_proto = C.ETH_PROTO_IPV6
+	}
+	backendKey.index = C.ulong(index)
+	backendKey.key = C.ulong(bpfId)
+
+	ipBuff := make([]byte, C.sizeof_struct_kbpf_ip, C.sizeof_struct_kbpf_ip)
+	C.memcpy(unsafe.Pointer(&ipBuff[0]), unsafe.Pointer(&kbpfIP), C.sizeof_struct_kbpf_ip)
+
+	keyBuff := make([]byte, C.sizeof_struct_kbpf_service_backend_key, C.sizeof_struct_kbpf_service_backend_key)
+	C.memcpy(unsafe.Pointer(&keyBuff[0]), unsafe.Pointer(&backendKey), C.sizeof_struct_kbpf_service_backend_key)
+
+	return mapServiceBackendIndexed.Upsert(keyBuff, ipBuff)
+}
+
+// returns a map of ip:index
+func bpfGetServiceToBackendIndxed(bpfId uint64) (map[string]uint64, error) {
+	all := make(map[string]uint64)
+	mapServiceBackendIndexed, err := bpfGetMap(map_path_service_backend_indexed)
+	if err != nil {
+		return nil, err
+	}
+	buff := make([]byte, C.sizeof_struct_kbpf_service_backend_key, C.sizeof_struct_kbpf_service_backend_key)
+	C.memset(unsafe.Pointer(&buff[0]), 0, C.sizeof_struct_kbpf_service_backend_key)
+
+	for {
+		buff, err = mapServiceBackendIndexed.GetNextKey(buff)
+		if err != nil {
+			return all, nil // error is returned when last key is read. // TODO find a better way
+		}
+		if len(buff) == 0 {
+			return all, nil
+		}
+
+		backendKey := *(*C.struct_kbpf_service_backend_key)(unsafe.Pointer(&buff[0]))
+
+		if uint64(backendKey.key) != bpfId {
+			continue
+		}
+
+		ipBuff, err := mapServiceBackendIndexed.Lookup(buff)
+		if err != nil {
+			return nil, err
+		}
+
+		thiskbpfIP := *(*C.struct_kbpf_ip)(unsafe.Pointer(&ipBuff[0]))
+		thisIP := kbpfIPToIP(&thiskbpfIP)
+
+		all[thisIP.String()] = uint64(backendKey.index)
+	}
+
+	return all, nil
+}
+
+func bpfDeleteServiceToBackendIndexed(bpfId uint64, index uint64, ip net.IP) error {
+	mapServiceBackendIndexed, err := bpfGetMap(map_path_service_backend_indexed)
+	if err != nil {
+		return err
+	}
+
+	backendKey := C.struct_kbpf_service_backend_key{}
+	if isIPv6(ip) {
+		backendKey.l2_proto = C.ETH_PROTO_IP
+	} else {
+		backendKey.l2_proto = C.ETH_PROTO_IPV6
+	}
+	backendKey.index = C.ulong(index)
+	backendKey.key = C.ulong(bpfId)
+
+	keyBuff := make([]byte, C.sizeof_struct_kbpf_service_backend_key, C.sizeof_struct_kbpf_service_backend_key)
+	C.memcpy(unsafe.Pointer(&keyBuff[0]), unsafe.Pointer(&backendKey), C.sizeof_struct_kbpf_service_backend_key)
+
+	return mapServiceBackendIndexed.Delete(keyBuff)
 }
 
 func bpfInsertOrUpdateBackendToService(bpfId uint64, ip net.IP) error {
@@ -128,7 +463,7 @@ func bpfGetBackendsToService(bpfId uint64) ([]net.IP, error) {
 		return nil, err
 	}
 	buff := make([]byte, C.sizeof_struct_kbpf_ip, C.sizeof_struct_kbpf_ip)
-	C.memset(unsafe.Pointer(&buff[0]), 0, C.sizeof_struct_kbpf_port_key)
+	C.memset(unsafe.Pointer(&buff[0]), 0, C.sizeof_struct_kbpf_ip)
 
 	for {
 		buff, err = mapBackendService.GetNextKey(buff)

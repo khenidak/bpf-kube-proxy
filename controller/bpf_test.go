@@ -386,6 +386,378 @@ func TestBackendIPs(t *testing.T) {
 	compareIPList(t, filtered, savedBackendIPs)
 }
 
+func TestIndexedBackend(t *testing.T) {
+	trackedOne := &trackedService{
+		namespaceName:  "serviceOne",
+		affinitySec:    10,
+		totalEndpoints: 10,
+		bpfId:          123456,
+	}
+
+	trackedTwo := &trackedService{
+		namespaceName:  "serviceTwo",
+		affinitySec:    10,
+		totalEndpoints: 10,
+		bpfId:          6541,
+	}
+
+	testData := map[uint64]map[string]uint64{
+		trackedOne.bpfId: {
+			"10.0.0.1": 1,
+			"2000::1":  1,
+
+			"10.0.0.2": 2,
+			"2000::2":  2,
+
+			"10.0.0.3": 3,
+			"2000::3":  3,
+		},
+		trackedTwo.bpfId: {
+			"11.0.0.1": 1,
+			"3000::1":  1,
+
+			"11.0.0.2": 2,
+			"3000::2":  2,
+
+			"11.0.0.3": 3,
+			"3000::3":  3,
+		},
+	}
+
+	deleteData := map[uint64]map[string]uint64{
+		trackedOne.bpfId: {
+			"10.0.0.2": 2,
+			"2000::2":  2,
+		},
+		trackedTwo.bpfId: {
+			"11.0.0.3": 3,
+			"3000::3":  3,
+		},
+	}
+
+	// test saved data against data
+	verifier := func(data map[uint64]map[string]uint64) {
+		// get and check
+		for bpfId, indexedIPs := range data {
+			got, err := bpfGetServiceToBackendIndxed(bpfId)
+			if err != nil {
+				t.Fatalf("failed to get indexed backend for %v with error %v", bpfId, err)
+			}
+			// compare
+			if len(got) != len(indexedIPs) {
+				t.Fatalf("expected count of indexed ips:%v got:%v", len(indexedIPs), len(got))
+			}
+
+			for ip, index := range indexedIPs {
+				savedIndex, ok := got[ip]
+				if !ok || savedIndex != index {
+					t.Fatalf("failed to find ip:%v with index:%v", ip, index)
+				}
+			}
+		}
+	}
+
+	// insert all backends
+	for bpfId, indexedIPs := range testData {
+		for ip, index := range indexedIPs {
+			err := bpfInsertOrUpdateServiceToBackendIndexed(bpfId, index, net.ParseIP(ip))
+			if err != nil {
+				t.Fatalf("failed to insert indexed backend ip:%v index:%v for:%v with error %v", ip, index, bpfId, err)
+			}
+		}
+	}
+
+	verifier(testData)
+	// delete
+	for bpfId, ipsToDelete := range deleteData {
+		for ipToDelete, index := range ipsToDelete {
+			delete(testData[bpfId], ipToDelete)
+			err := bpfDeleteServiceToBackendIndexed(bpfId, index, net.ParseIP(ipToDelete))
+			if err != nil {
+				t.Fatalf("failed to delete ip:%v for:%v index:%v with err:%v", ipToDelete, bpfId, index, err)
+			}
+		}
+	}
+	//reverify
+	verifier(testData)
+
+}
+
+func TestFlows(t *testing.T) {
+	testData := map[uint64][]flow{
+		1: {
+			{
+				srcIP:    net.ParseIP("10.0.0.10"),
+				srcPort:  5432,
+				l4_proto: 1,
+				destIP:   net.ParseIP("172.16.0.1"),
+				hit:      10,
+			},
+			{
+				srcIP:    net.ParseIP("10.0.0.10"),
+				srcPort:  5433,
+				l4_proto: 1,
+				destIP:   net.ParseIP("172.16.0.1"),
+				hit:      11,
+			},
+			{
+				srcIP:    net.ParseIP("10.0.0.10"),
+				srcPort:  5434,
+				l4_proto: 1,
+				destIP:   net.ParseIP("172.16.0.1"),
+				hit:      12,
+			},
+			{
+				srcIP:    net.ParseIP("2000::1"),
+				srcPort:  5432,
+				l4_proto: 1,
+				destIP:   net.ParseIP("4000::1"),
+				hit:      10,
+			},
+			{
+				srcIP:    net.ParseIP("2000::1"),
+				srcPort:  5433,
+				l4_proto: 1,
+				destIP:   net.ParseIP("4000::1"),
+				hit:      11,
+			},
+			{
+				srcIP:    net.ParseIP("2000::1"),
+				srcPort:  5434,
+				l4_proto: 1,
+				destIP:   net.ParseIP("4000::1"),
+				hit:      12,
+			},
+		},
+		2: {
+			{
+				srcIP:    net.ParseIP("10.0.0.10"),
+				srcPort:  5432,
+				l4_proto: 1,
+				destIP:   net.ParseIP("172.16.0.1"),
+				hit:      10,
+			},
+			{
+				srcIP:    net.ParseIP("10.0.0.10"),
+				srcPort:  5433,
+				l4_proto: 1,
+				destIP:   net.ParseIP("172.16.0.1"),
+				hit:      11,
+			},
+			{
+				srcIP:    net.ParseIP("10.0.0.10"),
+				srcPort:  5434,
+				l4_proto: 1,
+				destIP:   net.ParseIP("172.16.0.1"),
+				hit:      12,
+			},
+			{
+				srcIP:    net.ParseIP("2000::1"),
+				srcPort:  5432,
+				l4_proto: 1,
+				destIP:   net.ParseIP("4000::1"),
+				hit:      10,
+			},
+			{
+				srcIP:    net.ParseIP("2000::1"),
+				srcPort:  5433,
+				l4_proto: 1,
+				destIP:   net.ParseIP("4000::1"),
+				hit:      11,
+			},
+			{
+				srcIP:    net.ParseIP("2000::1"),
+				srcPort:  5434,
+				l4_proto: 1,
+				destIP:   net.ParseIP("4000::1"),
+				hit:      12,
+			},
+		},
+	}
+
+	verifier := func(expected []flow, got []flow) {
+		if len(expected) != len(got) {
+			t.Fatalf("expected and got are not the same length %v!=%v", len(expected), len(got))
+		}
+		for _, expectedOne := range expected {
+			found := false
+			for _, gotOne := range got {
+				if expectedOne.srcIP.String() == gotOne.srcIP.String() &&
+					expectedOne.srcPort == gotOne.srcPort &&
+					expectedOne.l4_proto == gotOne.l4_proto &&
+					expectedOne.destIP.String() == gotOne.destIP.String() &&
+					expectedOne.hit == gotOne.hit {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("failed to find flow %v in %v", expectedOne, got)
+			}
+		}
+	}
+	// insert them
+	for bpfId, testFlows := range testData {
+		for _, test := range testFlows {
+			err := bpfInsertOrUpdateFlow(bpfId, test.srcIP, test.srcPort, test.l4_proto, test.destIP, test.hit)
+			if err != nil {
+				t.Fatalf("error inserting a flow %+v err:%v", test, err)
+			}
+		}
+	}
+
+	gotFlows, err := bpfGetAllFlows()
+	if err != nil {
+		t.Fatalf("failed to get flows with error:%v", err)
+	}
+
+	// compare all
+	for bpfId, flows := range gotFlows {
+		testFlows, ok := testData[bpfId]
+		if !ok {
+			t.Fatalf("failed to find flow for %v", bpfId)
+		}
+		verifier(testFlows, flows)
+	}
+
+	// compare one
+	flowsForOne, err := bpfGetFlowsForService(1)
+	if err != nil {
+		t.Fatalf("failed to get flows for one service %v", err)
+	}
+	verifier(testData[1], flowsForOne)
+
+	// delete few flows
+	flows := testData[1]
+	for _, flow := range flows {
+		err := bpfDeleteFlow(1, flow.srcIP, flow.srcPort, flow.l4_proto)
+		if err != nil {
+			t.Fatalf("failed to delete flow %+v", err)
+		}
+	}
+	delete(testData, 1)
+
+	// re-get and verify
+	gotFlows, err = bpfGetAllFlows()
+	if err != nil {
+		t.Fatalf("failed to get flows with error:%v", err)
+	}
+
+	// compare all
+	for bpfId, flows := range gotFlows {
+		testFlows, ok := testData[bpfId]
+		if !ok {
+			t.Fatalf("failed to find flow for %v", bpfId)
+		}
+		verifier(testFlows, flows)
+	}
+}
+
+func TestAffinity(t *testing.T) {
+	testData := map[uint64][]affinity{
+		1: {
+			{
+				clientIP: net.ParseIP("10.0.0.10"),
+				destIP:   net.ParseIP("11.0.0.10"),
+				hit:      101,
+			},
+			{
+				clientIP: net.ParseIP("2000::1"),
+				destIP:   net.ParseIP("4000::1"),
+				hit:      102,
+			},
+		},
+		2: {
+			{
+				clientIP: net.ParseIP("10.0.1.10"),
+				destIP:   net.ParseIP("11.0.1.10"),
+				hit:      101,
+			},
+			{
+				clientIP: net.ParseIP("2001::1"),
+				destIP:   net.ParseIP("4001::1"),
+				hit:      102,
+			},
+		},
+	}
+
+	verifier := func(expected []affinity, got []affinity) {
+		if len(expected) != len(got) {
+			t.Fatalf("expected and got are not the same length %v!=%v", len(expected), len(got))
+		}
+		for _, expectedOne := range expected {
+			found := false
+			for _, gotOne := range got {
+				if expectedOne.clientIP.String() == gotOne.clientIP.String() &&
+					expectedOne.destIP.String() == gotOne.destIP.String() &&
+					expectedOne.hit == gotOne.hit {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("failed to find flow %v in %v", expectedOne, got)
+			}
+		}
+	}
+
+	// insert affinities
+	for bpfId, affList := range testData {
+		for _, aff := range affList {
+			err := bpfInsertOrUpdateAffinity(bpfId, aff.clientIP, aff.destIP, aff.hit)
+			if err != nil {
+				t.Fatalf("failed to insert affinity %+v with err: %v", aff, err)
+			}
+		}
+	}
+
+	// get one
+	for bpfId, affList := range testData {
+		got, err := bpfGetAffinityForService(bpfId)
+		if err != nil {
+			t.Fatalf("failed get affinities for %v with error:%v", bpfId, err)
+		}
+		verifier(affList, got)
+	}
+
+	// get all
+	allAff, err := bpfGetAllAffinities()
+	if err != nil {
+		t.Fatalf("failed to get affinities with err:%v", err)
+	}
+
+	for bpfId, affList := range allAff {
+		expectedAff, ok := testData[bpfId]
+		if !ok {
+			t.Fatalf("failed to find affinities for %v", bpfId)
+		}
+		verifier(expectedAff, affList)
+	}
+
+	afflist := testData[1]
+	for _, aff := range afflist {
+		err := bpfDeleteAffinity(1, aff.clientIP)
+		if err != nil {
+			t.Fatalf("failed to delete affinity %+v with err:%v", aff, err)
+		}
+	}
+
+	delete(testData, 1)
+	// get all and recompare
+	allAff, err = bpfGetAllAffinities()
+	if err != nil {
+		t.Fatalf("failed to get affinities with err:%v", err)
+	}
+
+	for bpfId, affList := range allAff {
+		expectedAff, ok := testData[bpfId]
+		if !ok {
+			t.Fatalf("failed to find affinities for %v", bpfId)
+		}
+		verifier(expectedAff, affList)
+	}
+}
+
 func compareIPList(t *testing.T, expected []net.IP, got []net.IP) {
 	if len(expected) != len(got) {
 		t.Fatalf("count of ips:%v does not equal expected:%v gotIPs:%v", len(got), len(expected), got)

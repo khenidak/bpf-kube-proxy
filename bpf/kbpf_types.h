@@ -124,7 +124,7 @@ struct bpf_map_def SEC("maps") services = {
 		.pinning = PIN_GLOBAL_NS,
 };
 // map: {service backend key (id, l2_proto, index) : ip
-struct bpf_map_def SEC("maps") service_backends = {
+struct bpf_map_def SEC("maps") service_backends_indexed = {
     .type = BPF_MAP_TYPE_HASH,
     .key_size = sizeof(struct kbpf_service_backend_key),
     .value_size = sizeof(struct kbpf_ip),
