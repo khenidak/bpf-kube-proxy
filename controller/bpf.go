@@ -382,13 +382,23 @@ func bpfInsertOrUpdateServiceToBackendIndexed(bpfId uint64, index uint64, ip net
 	return mapServiceBackendIndexed.Upsert(keyBuff, ipBuff)
 }
 
-// returns a map of ip:index
 func bpfGetServiceToBackendIndxed(bpfId uint64) (map[string]uint64, error) {
-	all := make(map[string]uint64)
+	all, err := bpfGetAllServiceToBackendIndxed()
+	if err != nil {
+		return nil, err
+	}
+
+	return all[bpfId], nil
+}
+
+// returns a map of bpfid=>ip:index
+func bpfGetAllServiceToBackendIndxed() (map[uint64]map[string]uint64, error) {
+	all := make(map[uint64]map[string]uint64)
 	mapServiceBackendIndexed, err := bpfGetMap(map_path_service_backend_indexed)
 	if err != nil {
 		return nil, err
 	}
+
 	buff := make([]byte, C.sizeof_struct_kbpf_service_backend_key, C.sizeof_struct_kbpf_service_backend_key)
 	C.memset(unsafe.Pointer(&buff[0]), 0, C.sizeof_struct_kbpf_service_backend_key)
 
@@ -403,19 +413,25 @@ func bpfGetServiceToBackendIndxed(bpfId uint64) (map[string]uint64, error) {
 
 		backendKey := *(*C.struct_kbpf_service_backend_key)(unsafe.Pointer(&buff[0]))
 
-		if uint64(backendKey.key) != bpfId {
-			continue
-		}
-
 		ipBuff, err := mapServiceBackendIndexed.Lookup(buff)
 		if err != nil {
 			return nil, err
 		}
 
+		if len(ipBuff) == 0 {
+			continue
+		}
+
+		if _, ok := all[uint64(backendKey.key)]; !ok {
+			all[uint64(backendKey.key)] = make(map[string]uint64)
+		}
+
+		byBpfId := all[uint64(backendKey.key)]
+
 		thiskbpfIP := *(*C.struct_kbpf_ip)(unsafe.Pointer(&ipBuff[0]))
 		thisIP := kbpfIPToIP(&thiskbpfIP)
 
-		all[thisIP.String()] = uint64(backendKey.index)
+		byBpfId[thisIP.String()] = uint64(backendKey.index)
 	}
 
 	return all, nil
@@ -443,78 +459,27 @@ func bpfDeleteServiceToBackendIndexed(bpfId uint64, index uint64, ip net.IP) err
 }
 
 func bpfInsertOrUpdateBackendToService(bpfId uint64, ip net.IP) error {
-	mapBackendService, err := bpfGetMap(map_path_backend_service)
-	if err != nil {
-		return err
-	}
-
-	kbpfIP := *(ipToKbpfIP(ip))
-	buff := make([]byte, C.sizeof_struct_kbpf_ip, C.sizeof_struct_kbpf_ip)
-	C.memcpy(unsafe.Pointer(&buff[0]), unsafe.Pointer(&kbpfIP), C.sizeof_struct_kbpf_ip)
-
-	return mapBackendService.Upsert(buff, bpfId)
+	return bpfInsertOrUpdateIPInIPMap(map_path_backend_service, bpfId, ip)
 }
 
 func bpfGetBackendsToService(bpfId uint64) ([]net.IP, error) {
-
-	all := make([]net.IP, 0)
-	mapBackendService, err := bpfGetMap(map_path_backend_service)
+	all, err := bpfGetAllBackendsToService()
 	if err != nil {
 		return nil, err
 	}
-	buff := make([]byte, C.sizeof_struct_kbpf_ip, C.sizeof_struct_kbpf_ip)
-	C.memset(unsafe.Pointer(&buff[0]), 0, C.sizeof_struct_kbpf_ip)
+	return all[bpfId], nil
+}
 
-	for {
-		buff, err = mapBackendService.GetNextKey(buff)
-		if err != nil {
-			return all, nil // error is returned when last key is read. // TODO find a better way
-		}
-		if len(buff) == 0 {
-			return all, nil
-		}
-		buffBpfId, err := mapBackendService.Lookup(buff)
-		if err != nil {
-			return nil, err
-		}
-
-		savedBpfId := *(*uint64)(unsafe.Pointer(&buffBpfId[0]))
-
-		if savedBpfId == bpfId {
-			thisKey := *(*C.struct_kbpf_ip)(unsafe.Pointer(&buff[0]))
-			all = append(all, kbpfIPToIP(&thisKey))
-		}
-	}
-
-	return all, nil
-
+func bpfGetAllBackendsToService() (map[uint64][]net.IP, error) {
+	return bpfGetAllIPsFromIPMap(map_path_backend_service)
 }
 
 func bpfDeleteBackendToService(bpfId uint64, ip net.IP) error {
-	mapBackendService, err := bpfGetMap(map_path_backend_service)
-	if err != nil {
-		return err
-	}
-
-	kbpfIP := *(ipToKbpfIP(ip))
-	buff := make([]byte, C.sizeof_struct_kbpf_ip, C.sizeof_struct_kbpf_ip)
-	C.memcpy(unsafe.Pointer(&buff[0]), unsafe.Pointer(&kbpfIP), C.sizeof_struct_kbpf_ip)
-
-	return mapBackendService.Delete(buff)
+	return bpfDeleteIPFromIPMap(map_path_backend_service, ip)
 }
 
-// gets service info
-
 func bpfInsertOrUpdateServiceIP(bpfId uint64, ip net.IP) error {
-	mapServiceIPs, err := bpfGetMap(map_path_service_ips_to_service)
-	if err != nil {
-		return err
-	}
-
-	kbpfIP := *(ipToKbpfIP(ip))
-	buff := make([]byte, C.sizeof_struct_kbpf_ip, C.sizeof_struct_kbpf_ip)
-	C.memcpy(unsafe.Pointer(&buff[0]), unsafe.Pointer(&kbpfIP), C.sizeof_struct_kbpf_ip)
-	return mapServiceIPs.Upsert(buff, bpfId)
+	return bpfInsertOrUpdateIPInIPMap(map_path_service_ips_to_service, bpfId, ip)
 }
 
 func bpfGetServiceIPs(bpfId uint64) ([]net.IP, error) {
@@ -525,63 +490,31 @@ func bpfGetServiceIPs(bpfId uint64) ([]net.IP, error) {
 
 	return all[bpfId], nil
 }
-func bpfGetAllServiceIPs() (map[uint64][]net.IP, error) {
-	all := make(map[uint64][]net.IP)
-	mapServiceIPs, err := bpfGetMap(map_path_service_ips_to_service)
-	if err != nil {
-		return nil, err
-	}
-
-	buff := make([]byte, C.sizeof_struct_kbpf_ip, C.sizeof_struct_kbpf_ip)
-	C.memset(unsafe.Pointer(&buff[0]), 0, C.sizeof_struct_kbpf_port_key)
-
-	for {
-		buff, err = mapServiceIPs.GetNextKey(buff)
-		if err != nil {
-			return all, nil // error is returned when last key is read. // TODO find a better way
-		}
-		if len(buff) == 0 {
-			return all, nil
-		}
-		buffBpfId, err := mapServiceIPs.Lookup(buff)
-		if err != nil {
-			return nil, err
-		}
-
-		savedBpfId := *(*uint64)(unsafe.Pointer(&buffBpfId[0]))
-		thisKey := *(*C.struct_kbpf_ip)(unsafe.Pointer(&buff[0]))
-		if _, ok := all[savedBpfId]; !ok {
-			all[savedBpfId] = make([]net.IP, 0)
-		}
-		all[savedBpfId] = append(all[savedBpfId], kbpfIPToIP(&thisKey))
-	}
-
-	return all, nil
-}
-
 func bpfDeleteServiceIP(bpfId uint64, ip net.IP) error {
-	mapServiceIPs, err := bpfGetMap(map_path_service_ips_to_service)
-	if err != nil {
-		return err
-	}
-
-	kbpfIP := *(ipToKbpfIP(ip))
-	buff := make([]byte, C.sizeof_struct_kbpf_ip, C.sizeof_struct_kbpf_ip)
-	C.memcpy(unsafe.Pointer(&buff[0]), unsafe.Pointer(&kbpfIP), C.sizeof_struct_kbpf_ip)
-
-	return mapServiceIPs.Delete(buff)
+	return bpfDeleteIPFromIPMap(map_path_service_ips_to_service, ip)
+}
+func bpfGetAllServiceIPs() (map[uint64][]net.IP, error) {
+	return bpfGetAllIPsFromIPMap(map_path_service_ips_to_service)
 }
 
 func bpfGetServiceToBackendPort(bpfId uint64, l4_proto uint8, servicePort uint16) (uint16, error) {
 	return bpfGetPortFromPortMap(map_path_service_port_to_backend_port, bpfId, l4_proto, servicePort)
 }
 
-func bpfInsertOrUpdateServiceToBackendPort(bpfId uint64, l4_proto uint8, servicePort uint16, backendPort uint16) error {
-	return bpfInsertOrUpdatePortInPortMap(map_path_service_port_to_backend_port, bpfId, l4_proto, servicePort, backendPort)
+func bpfGetServiceToBackendPorts(bpfId uint64) (map[uint8]map[uint16]uint16, error) {
+	all, err := bpfGetAllPortsFromPortMap(map_path_service_port_to_backend_port)
+	if err != nil {
+		return nil, err
+	}
+
+	return all[bpfId], nil
+}
+func bpfGetAllServiceToBackendPorts() (map[uint64]map[uint8]map[uint16]uint16, error) {
+	return bpfGetAllPortsFromPortMap(map_path_service_port_to_backend_port)
 }
 
-func bpfGetServiceToBackendPorts(bpfId uint64) (map[uint8]map[uint16]uint16, error) {
-	return bpfGetPortsFromPortMap(map_path_service_port_to_backend_port, bpfId)
+func bpfInsertOrUpdateServiceToBackendPort(bpfId uint64, l4_proto uint8, servicePort uint16, backendPort uint16) error {
+	return bpfInsertOrUpdatePortInPortMap(map_path_service_port_to_backend_port, bpfId, l4_proto, servicePort, backendPort)
 }
 
 func bpfDeleteServiceToBackendPort(bpfId uint64, l4_proto uint8, servicePort uint16) error {
@@ -597,167 +530,18 @@ func bpfInsertOrUpdateBackendToServicePort(bpfId uint64, l4_proto uint8, backend
 }
 
 func bpfGetBackEndToServicePorts(bpfId uint64) (map[uint8]map[uint16]uint16, error) {
-	return bpfGetPortsFromPortMap(map_path_backend_port_to_service_port, bpfId)
+	all, err := bpfGetAllPortsFromPortMap(map_path_backend_port_to_service_port)
+	if err != nil {
+		return nil, err
+	}
+	return all[bpfId], nil
+}
+func bpfGetAllBackEndToServicePorts() (map[uint64]map[uint8]map[uint16]uint16, error) {
+	return bpfGetAllPortsFromPortMap(map_path_backend_port_to_service_port)
 }
 
 func bpfDeleteBackendToServicePort(bpfId uint64, l4_proto uint8, backendPort uint16) error {
 	return bpfDeletePortFromPortMap(map_path_backend_port_to_service_port, bpfId, l4_proto, backendPort)
-}
-
-func bpfGetPortFromPortMap(mapPath string, bpfId uint64, l4_proto uint8, fromPort uint16) (uint16, error) {
-	thisMap, err := bpfGetMap(mapPath)
-	if err != nil {
-		return 0, err
-	}
-
-	bpfServicePort := C.struct_kbpf_port_key{
-		key:      C.ulong(bpfId),
-		port:     C.htons(C.ushort(fromPort)),
-		l4_proto: C.uchar(C.htons(C.ushort(l4_proto)) >> 8),
-	}
-
-	buff := make([]byte, C.sizeof_struct_kbpf_port_key, C.sizeof_struct_kbpf_port_key)
-	C.memcpy(unsafe.Pointer(&buff[0]), unsafe.Pointer(&bpfServicePort), C.sizeof_struct_kbpf_port_key)
-
-	toPort, err := thisMap.Lookup(buff)
-	if err != nil {
-		return 0, err
-	}
-
-	port := *(*uint16)(unsafe.Pointer(&toPort[0]))
-	return uint16(C.ntohs(C.ushort(port))), nil
-}
-
-func bpfInsertOrUpdatePortInPortMap(mapPath string, bpfId uint64, l4_proto uint8, fromPort uint16, toPort uint16) error {
-	thisMap, err := bpfGetMap(mapPath)
-	if err != nil {
-		return err
-	}
-	bpfServicePort := C.struct_kbpf_port_key{
-		key:      C.ulong(bpfId),
-		port:     C.htons(C.ushort(fromPort)),
-		l4_proto: (C.uchar)(C.htons(C.ushort(l4_proto)) >> 8),
-	}
-
-	buff := make([]byte, C.sizeof_struct_kbpf_port_key, C.sizeof_struct_kbpf_port_key)
-	C.memcpy(unsafe.Pointer(&buff[0]), unsafe.Pointer(&bpfServicePort), C.sizeof_struct_kbpf_port_key)
-
-	return thisMap.Upsert(buff, (uint16)(C.htons(C.ushort(toPort))))
-}
-
-// returns ports by proto
-func bpfGetPortsFromPortMap(mapPath string, bpfId uint64) (map[uint8]map[uint16]uint16, error) {
-	all := make(map[uint8]map[uint16]uint16)
-	thisMap, err := bpfGetMap(mapPath)
-	if err != nil {
-		return nil, err
-	}
-
-	bpfServicePort := C.struct_kbpf_port_key{}
-	buff := make([]byte, C.sizeof_struct_kbpf_port_key, C.sizeof_struct_kbpf_port_key)
-	C.memset(unsafe.Pointer(&buff[0]), 0, C.sizeof_struct_kbpf_port_key)
-
-	for {
-		buff, err = thisMap.GetNextKey(buff)
-		if err != nil {
-			return all, nil // error is returned when last key is read. // TODO find a better way
-		}
-		if len(buff) == 0 {
-			return all, nil
-		}
-
-		buffToPort, err := thisMap.Lookup(buff)
-		if err != nil {
-			return nil, err
-		}
-
-		bpfServicePort = *(*C.struct_kbpf_port_key)(unsafe.Pointer(&buff[0]))
-
-		if uint64(bpfServicePort.key) == bpfId {
-			proto := uint8(C.ntohs(C.ushort(bpfServicePort.l4_proto) << 8))
-			toPort := *(*C.ushort)(unsafe.Pointer(&buffToPort[0]))
-
-			if _, ok := all[proto]; !ok {
-				all[proto] = make(map[uint16]uint16)
-			}
-
-			byProtoMap := all[proto]
-			byProtoMap[uint16(C.ntohs(bpfServicePort.port))] = uint16(C.ntohs(toPort))
-		}
-	}
-
-	return all, nil
-}
-
-func bpfDeletePortFromPortMap(mapPath string, bpfId uint64, l4_proto uint8, fromPort uint16) error {
-	thisMap, err := bpfGetMap(mapPath)
-	if err != nil {
-		return err
-	}
-	bpfServicePort := C.struct_kbpf_port_key{
-		key:      C.ulong(bpfId),
-		port:     C.htons(C.ushort(fromPort)),
-		l4_proto: C.uchar(C.htons(C.ushort(l4_proto)) >> 8),
-	}
-
-	buff := make([]byte, C.sizeof_struct_kbpf_port_key, C.sizeof_struct_kbpf_port_key)
-	C.memcpy(unsafe.Pointer(&buff[0]), unsafe.Pointer(&bpfServicePort), C.sizeof_struct_kbpf_port_key)
-
-	return thisMap.Delete(buff)
-}
-
-// converts an ip to ip struct used in various bpf maps
-func ipToKbpfIP(from net.IP) *C.struct_kbpf_ip {
-	kbpfIP := C.struct_kbpf_ip{}
-
-	if isIPv6(from) {
-		kbpfIP.l2_proto = C.ETH_PROTO_IPV6
-
-		// hton every int
-		for i := 0; i < 4; i++ {
-			htoned := C.htonl(*(*C.uint)(unsafe.Pointer(&from[i*4])))
-			C.memcpy(unsafe.Pointer(&kbpfIP.ip[i]), unsafe.Pointer(&htoned), 4)
-		}
-		return &kbpfIP
-	}
-
-	kbpfIP.l2_proto = C.ETH_PROTO_IP
-	// process as ipv4
-	asIPv4 := from.To4() //https://golang.org/src/net/ip.go?s=5275:5296#L189
-	ipv4 := *(*uint32)(unsafe.Pointer(&asIPv4[0]))
-	ipv4n := C.htonl((C.uint)(ipv4))
-	kbpfIP.ip[0] = ipv4n
-
-	return &kbpfIP
-}
-
-// the inverse of ipToKbpfIP
-func kbpfIPToIP(from *C.struct_kbpf_ip) net.IP {
-	var ip net.IP
-	if from.l2_proto == C.ETH_PROTO_IPV6 {
-		ip = net.ParseIP("::1") // just to allocate it
-		for i := 0; i < 4; i++ {
-			// ntoh in place
-			from.ip[i] = C.ntohl(from.ip[i])
-		}
-
-		C.memcpy(unsafe.Pointer(&ip[0]), unsafe.Pointer(&from.ip), 16)
-		return ip
-	}
-
-	// process as ipv4
-	ipv4 := *(*C.uint)(unsafe.Pointer(&from.ip))
-	ipv4 = C.ntohl(ipv4)
-	ip = make(net.IP, 4)
-	ip[0] = byte(ipv4)
-	ip[1] = byte(ipv4 >> 8)
-	ip[2] = byte(ipv4 >> 16)
-	ip[3] = byte(ipv4 >> 24)
-
-	return ip
-}
-func isIPv6(ip net.IP) bool {
-	return ip != nil && ip.To4() == nil
 }
 
 func bpfGetAllServiceNameKey() (map[string]uint64, error) {
@@ -847,7 +631,6 @@ func bpfDeleteServiceNameKey(name string) error {
 }
 
 func bpfGetServiceInfo(bpfId uint64) (*trackedService, error) {
-
 	mapServices, err := bpfGetMap(map_path_services)
 	if err != nil {
 		return nil, err
@@ -941,4 +724,224 @@ func bpfDeleteServiceInfo(bpfId uint64) error {
 	}
 
 	return mapServices.Delete(bpfId)
+}
+
+// service-port =>backend-port and backend-port=>service-port are similar maps (port+proto+bpfId=>port)
+// the below funcs operate on them
+func bpfGetPortFromPortMap(mapPath string, bpfId uint64, l4_proto uint8, fromPort uint16) (uint16, error) {
+	thisMap, err := bpfGetMap(mapPath)
+	if err != nil {
+		return 0, err
+	}
+
+	bpfServicePort := C.struct_kbpf_port_key{
+		key:      C.ulong(bpfId),
+		port:     C.htons(C.ushort(fromPort)),
+		l4_proto: C.uchar(C.htons(C.ushort(l4_proto)) >> 8),
+	}
+
+	buff := make([]byte, C.sizeof_struct_kbpf_port_key, C.sizeof_struct_kbpf_port_key)
+	C.memcpy(unsafe.Pointer(&buff[0]), unsafe.Pointer(&bpfServicePort), C.sizeof_struct_kbpf_port_key)
+
+	toPort, err := thisMap.Lookup(buff)
+	if err != nil {
+		return 0, err
+	}
+
+	port := *(*uint16)(unsafe.Pointer(&toPort[0]))
+	return uint16(C.ntohs(C.ushort(port))), nil
+}
+
+func bpfInsertOrUpdatePortInPortMap(mapPath string, bpfId uint64, l4_proto uint8, fromPort uint16, toPort uint16) error {
+	thisMap, err := bpfGetMap(mapPath)
+	if err != nil {
+		return err
+	}
+	bpfServicePort := C.struct_kbpf_port_key{
+		key:      C.ulong(bpfId),
+		port:     C.htons(C.ushort(fromPort)),
+		l4_proto: (C.uchar)(C.htons(C.ushort(l4_proto)) >> 8),
+	}
+
+	buff := make([]byte, C.sizeof_struct_kbpf_port_key, C.sizeof_struct_kbpf_port_key)
+	C.memcpy(unsafe.Pointer(&buff[0]), unsafe.Pointer(&bpfServicePort), C.sizeof_struct_kbpf_port_key)
+
+	return thisMap.Upsert(buff, (uint16)(C.htons(C.ushort(toPort))))
+}
+
+// returns ports by map bpfid->proto->from->to (sorry)
+func bpfGetAllPortsFromPortMap(mapPath string) (map[uint64]map[uint8]map[uint16]uint16, error) {
+	all := make(map[uint64]map[uint8]map[uint16]uint16)
+	thisMap, err := bpfGetMap(mapPath)
+	if err != nil {
+		return nil, err
+	}
+
+	bpfServicePort := C.struct_kbpf_port_key{}
+	buff := make([]byte, C.sizeof_struct_kbpf_port_key, C.sizeof_struct_kbpf_port_key)
+	C.memset(unsafe.Pointer(&buff[0]), 0, C.sizeof_struct_kbpf_port_key)
+
+	for {
+		buff, err = thisMap.GetNextKey(buff)
+		if err != nil {
+			return all, nil // error is returned when last key is read. // TODO find a better way
+		}
+		if len(buff) == 0 {
+			return all, nil
+		}
+
+		buffToPort, err := thisMap.Lookup(buff)
+		if err != nil {
+			return nil, err
+		}
+
+		bpfServicePort = *(*C.struct_kbpf_port_key)(unsafe.Pointer(&buff[0]))
+		bpfId := uint64(bpfServicePort.key)
+		proto := uint8(C.ntohs(C.ushort(bpfServicePort.l4_proto) << 8))
+		toPort := *(*C.ushort)(unsafe.Pointer(&buffToPort[0]))
+
+		if _, ok := all[bpfId]; !ok {
+			all[bpfId] = make(map[uint8]map[uint16]uint16)
+		}
+		if _, ok := all[bpfId][proto]; !ok {
+			all[bpfId][proto] = make(map[uint16]uint16)
+		}
+
+		byProtoMap := all[bpfId][proto]
+		byProtoMap[uint16(C.ntohs(bpfServicePort.port))] = uint16(C.ntohs(toPort))
+	}
+
+	return all, nil
+}
+
+func bpfDeletePortFromPortMap(mapPath string, bpfId uint64, l4_proto uint8, fromPort uint16) error {
+	thisMap, err := bpfGetMap(mapPath)
+	if err != nil {
+		return err
+	}
+	bpfServicePort := C.struct_kbpf_port_key{
+		key:      C.ulong(bpfId),
+		port:     C.htons(C.ushort(fromPort)),
+		l4_proto: C.uchar(C.htons(C.ushort(l4_proto)) >> 8),
+	}
+
+	buff := make([]byte, C.sizeof_struct_kbpf_port_key, C.sizeof_struct_kbpf_port_key)
+	C.memcpy(unsafe.Pointer(&buff[0]), unsafe.Pointer(&bpfServicePort), C.sizeof_struct_kbpf_port_key)
+
+	return thisMap.Delete(buff)
+}
+
+// Backend=>service and ServiceIP=>service are similar maps (ip=>bpfID)
+// the below funcs operate on them using map path
+func bpfInsertOrUpdateIPInIPMap(mapPath string, bpfId uint64, ip net.IP) error {
+	theMap, err := bpfGetMap(mapPath)
+	if err != nil {
+		return err
+	}
+
+	kbpfIP := *(ipToKbpfIP(ip))
+	buff := make([]byte, C.sizeof_struct_kbpf_ip, C.sizeof_struct_kbpf_ip)
+	C.memcpy(unsafe.Pointer(&buff[0]), unsafe.Pointer(&kbpfIP), C.sizeof_struct_kbpf_ip)
+	return theMap.Upsert(buff, bpfId)
+}
+
+func bpfGetAllIPsFromIPMap(mapPath string) (map[uint64][]net.IP, error) {
+	all := make(map[uint64][]net.IP)
+	theMap, err := bpfGetMap(mapPath)
+	if err != nil {
+		return nil, err
+	}
+
+	buff := make([]byte, C.sizeof_struct_kbpf_ip, C.sizeof_struct_kbpf_ip)
+	C.memset(unsafe.Pointer(&buff[0]), 0, C.sizeof_struct_kbpf_port_key)
+
+	for {
+		buff, err = theMap.GetNextKey(buff)
+		if err != nil {
+			return all, nil // error is returned when last key is read. // TODO find a better way
+		}
+		if len(buff) == 0 {
+			return all, nil
+		}
+		buffBpfId, err := theMap.Lookup(buff)
+		if err != nil {
+			return nil, err
+		}
+
+		savedBpfId := *(*uint64)(unsafe.Pointer(&buffBpfId[0]))
+		thisKey := *(*C.struct_kbpf_ip)(unsafe.Pointer(&buff[0]))
+		if _, ok := all[savedBpfId]; !ok {
+			all[savedBpfId] = make([]net.IP, 0)
+		}
+		all[savedBpfId] = append(all[savedBpfId], kbpfIPToIP(&thisKey))
+	}
+
+	return all, nil
+}
+
+func bpfDeleteIPFromIPMap(mapPath string, ip net.IP) error {
+	theMap, err := bpfGetMap(mapPath)
+	if err != nil {
+		return err
+	}
+
+	kbpfIP := *(ipToKbpfIP(ip))
+	buff := make([]byte, C.sizeof_struct_kbpf_ip, C.sizeof_struct_kbpf_ip)
+	C.memcpy(unsafe.Pointer(&buff[0]), unsafe.Pointer(&kbpfIP), C.sizeof_struct_kbpf_ip)
+
+	return theMap.Delete(buff)
+}
+
+// converts an ip to ip struct used in various bpf maps
+func ipToKbpfIP(from net.IP) *C.struct_kbpf_ip {
+	kbpfIP := C.struct_kbpf_ip{}
+
+	if isIPv6(from) {
+		kbpfIP.l2_proto = C.ETH_PROTO_IPV6
+
+		// hton every int
+		for i := 0; i < 4; i++ {
+			htoned := C.htonl(*(*C.uint)(unsafe.Pointer(&from[i*4])))
+			C.memcpy(unsafe.Pointer(&kbpfIP.ip[i]), unsafe.Pointer(&htoned), 4)
+		}
+		return &kbpfIP
+	}
+
+	kbpfIP.l2_proto = C.ETH_PROTO_IP
+	// process as ipv4
+	asIPv4 := from.To4() //https://golang.org/src/net/ip.go?s=5275:5296#L189
+	ipv4 := *(*uint32)(unsafe.Pointer(&asIPv4[0]))
+	ipv4n := C.htonl((C.uint)(ipv4))
+	kbpfIP.ip[0] = ipv4n
+
+	return &kbpfIP
+}
+
+// the inverse of ipToKbpfIP
+func kbpfIPToIP(from *C.struct_kbpf_ip) net.IP {
+	var ip net.IP
+	if from.l2_proto == C.ETH_PROTO_IPV6 {
+		ip = net.ParseIP("::1") // just to allocate it
+		for i := 0; i < 4; i++ {
+			// ntoh in place
+			from.ip[i] = C.ntohl(from.ip[i])
+		}
+
+		C.memcpy(unsafe.Pointer(&ip[0]), unsafe.Pointer(&from.ip), 16)
+		return ip
+	}
+
+	// process as ipv4
+	ipv4 := *(*C.uint)(unsafe.Pointer(&from.ip))
+	ipv4 = C.ntohl(ipv4)
+	ip = make(net.IP, 4)
+	ip[0] = byte(ipv4)
+	ip[1] = byte(ipv4 >> 8)
+	ip[2] = byte(ipv4 >> 16)
+	ip[3] = byte(ipv4 >> 24)
+
+	return ip
+}
+func isIPv6(ip net.IP) bool {
+	return ip != nil && ip.To4() == nil
 }

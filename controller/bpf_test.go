@@ -545,6 +545,7 @@ func TestIndexedBackend(t *testing.T) {
 
 	// test saved data against data
 	verifier := func(data map[uint64]map[string]uint64) {
+		// TODO: test GetAll...
 		// get and check
 		for bpfId, indexedIPs := range data {
 			got, err := bpfGetServiceToBackendIndxed(bpfId)
@@ -588,7 +589,6 @@ func TestIndexedBackend(t *testing.T) {
 	}
 	//reverify
 	verifier(testData)
-
 }
 
 func TestFlows(t *testing.T) {

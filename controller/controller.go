@@ -3,11 +3,9 @@ package controller
 import (
 	"hash/fnv"
 	"math/rand"
+	"net"
 	"sync"
-
 	"time"
-	// "fmt"
-	// "net"
 )
 
 const min_flow_expiration_sec = 5
@@ -51,7 +49,6 @@ func NewController(logWriter func(format string, a ...interface{}), flowExpireDu
 
 	// TODO: start affinity and flows loops
 	return c, nil
-
 }
 
 // data in maps can go slightly out of drift
@@ -83,12 +80,10 @@ func (c *ctrl) buildInternalData() error {
 		for name, key := range allNameKeys {
 			if key == bpfId {
 				// set the name
-				c.logWrite("bpid=>name %v=>%v", bpfId, name)
 				tracked.namespaceName = name
 			}
 		}
 		if tracked.namespaceName == "" {
-			c.logWrite("service %+v is not in name/key mapping (orphaned).. removing", tracked)
 			err := bpfDeleteServiceInfo(bpfId)
 			if err != nil {
 				return err
@@ -99,28 +94,116 @@ func (c *ctrl) buildInternalData() error {
 		c.services[tracked.namespaceName] = tracked
 	}
 
+	// TODO this can run concurrently
+
 	// remove the rest of orphans
+	// *always* remove serviceIPs first, because it is the very
+	// first thing egress data path look at
 	if err := c.removeOrphanedServiceIPs(); err != nil {
+		return err
+	}
+
+	if err := c.removeOrphanedBackends(); err != nil {
+		return err
+	}
+
+	if err := c.removeOrphanedIndexedBackend(); err != nil {
 		return err
 	}
 
 	if err := c.removeOrphanedFlows(); err != nil {
 		return err
 	}
+
 	if err := c.removeOrphanedAffinities(); err != nil {
 		return err
 	}
 
-	// TODO: loader
-	// get All Services
-	// for each of the sub data itemsp:
-	// ports
-	// backend ends
-	// indexed back end
-	// flows
-	// affinities
-	// if service key does not exist.. delete it
+	if err := c.removeOrphanedPorts(); err != nil {
+		return err
+	}
 
+	// TODO: loader
+	// TODO: flows and affinities sync loops
+	return nil
+}
+
+func (c *ctrl) removeOrphanedIndexedBackend() error {
+	allIndexedBackends, err := bpfGetAllServiceToBackendIndxed()
+	if err != nil {
+		return err
+	}
+
+	for bpfId, ipIndex := range allIndexedBackends {
+		if c.hasTrackedServiceByBpfId(bpfId) {
+			continue
+		}
+
+		for ip, index := range ipIndex {
+			err := bpfDeleteServiceToBackendIndexed(bpfId, index, net.ParseIP(ip))
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+func (c *ctrl) removeOrphanedPorts() error {
+	servicePorts, err := bpfGetAllServiceToBackendPorts()
+	if err != nil {
+		return err
+	}
+	backendPorts, err := bpfGetAllBackEndToServicePorts()
+	if err != nil {
+		return err
+	}
+	// service => backend ports
+	for bpfId, byProto := range servicePorts {
+		if c.hasTrackedServiceByBpfId(bpfId) {
+			continue
+		}
+		for proto, fromTo := range byProto {
+			for from, _ := range fromTo {
+				err := bpfDeleteServiceToBackendPort(bpfId, proto, from)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	for bpfId, byProto := range backendPorts {
+		if c.hasTrackedServiceByBpfId(bpfId) {
+			continue
+		}
+		for proto, fromTo := range byProto {
+			for from, _ := range fromTo {
+				err := bpfDeleteBackendToServicePort(bpfId, proto, from)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+func (c *ctrl) removeOrphanedBackends() error {
+	allBackends, err := bpfGetAllBackendsToService()
+	if err != nil {
+		return nil
+	}
+
+	for bpfId, backends := range allBackends {
+		if !c.hasTrackedServiceByBpfId(bpfId) {
+			for _, backend := range backends {
+				err := bpfDeleteBackendToService(bpfId, backend)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -133,7 +216,6 @@ func (c *ctrl) removeOrphanedServiceIPs() error {
 
 	for bpfId, serviceIPs := range allServiceIPs {
 		if !c.hasTrackedServiceByBpfId(bpfId) {
-			c.logWrite("serviceIPs for service %v are orphaned, deleting", bpfId)
 			for _, serviceIP := range serviceIPs {
 				err := bpfDeleteServiceIP(bpfId, serviceIP)
 				if err != nil {
@@ -155,7 +237,6 @@ func (c *ctrl) removeOrphanedFlows() error {
 
 	for bpfId, flows := range allFlows {
 		if !c.hasTrackedServiceByBpfId(bpfId) {
-			c.logWrite("flows for service %v are orphaned, deleting", bpfId)
 			for _, flow := range flows {
 				err := bpfDeleteFlow(bpfId, flow.srcIP, flow.srcPort, flow.l4_proto)
 				if err != nil {
@@ -177,7 +258,6 @@ func (c *ctrl) removeOrphanedAffinities() error {
 
 	for bpfId, affs := range allAff {
 		if !c.hasTrackedServiceByBpfId(bpfId) {
-			c.logWrite("affinities for service %v are orphaned, deleting", bpfId)
 			for _, aff := range affs {
 				err := bpfDeleteAffinity(bpfId, aff.clientIP)
 				if err != nil {
