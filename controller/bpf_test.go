@@ -3,57 +3,175 @@ package controller
 import (
 	"net"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
 )
 
-func TestServiceInfo(t *testing.T) {
-	assert := assert.New(t)
-
-	serviceName := "testService"
-	tracked := &trackedService{
-		namespaceName:  serviceName,
-		affinitySec:    10,
-		totalEndpoints: 10,
-		bpfId:          123456,
+func TestServiceNameKey(t *testing.T) {
+	testData := map[string]uint64{
+		"service1": uint64(1),
+		"service2": uint64(2),
+		"service3": uint64(3),
+		"service4": uint64(4),
+		"service5": uint64(5),
 	}
 
-	err := bpfInsertOrUpdateServiceInfo(tracked)
-	assert.NoErrorf(err, "failed to insert service info with error %v", err)
+	deleteTestData := []string{"service2", "service4"}
 
-	readTracked, err := bpfGetServiceInfo(serviceName)
+	comparer := func(expected, got map[string]uint64) {
+		t.Helper()
+		if len(expected) != len(got) {
+			t.Fatalf("expected service name key %v!=%v %+v", len(expected), len(got), got)
+		}
+		for expectedName, expectedKey := range expected {
+			gotKey, ok := got[expectedName]
+			if !ok || gotKey != expectedKey {
+				t.Fatalf("could not find service %v:%v in %+v", expectedName, expectedKey, got)
+			}
+		}
+	}
 
-	assert.NoErrorf(err, "failed to read service info %v", err)
-	assert.NotNil(readTracked, "service %v should be in bpf map, it was not", serviceName)
+	// insert
+	for name, key := range testData {
+		err := bpfInsertOrUpdateServiceNameKey(name, key)
+		if err != nil {
+			t.Fatalf("failed to insert service %v:%v with error %v", name, key, err)
+		}
+	}
+	// get one by one
+	for name, key := range testData {
+		gotKey, err := bpfGetServiceKeyByName(name)
+		if err != nil {
+			t.Fatalf("failed to get service %v with err %v", name, err)
+		}
+		if gotKey != key {
+			t.Fatalf("expected service key:%v for service:%v but got:%v", key, name, gotKey)
+		}
+	}
+	// get all and compare
+	allServiceNamekey, err := bpfGetAllServiceNameKey()
+	if err != nil {
+		t.Fatalf("failed to get all services namekey with error %v", err)
+	}
 
-	assert.Equal(readTracked.bpfId, tracked.bpfId, "bpfid should be the same")
-	assert.Equal(readTracked.totalEndpoints, tracked.totalEndpoints, "endpoint count should be the same")
-	assert.Equal(readTracked.affinitySec, tracked.affinitySec, "affinitySec should be the same")
-	assert.Equal(readTracked.namespaceName, tracked.namespaceName, "namespaceName should be the same")
+	comparer(testData, allServiceNamekey)
 
-	// saving affinity should automatically load endpoint count
-	oldcount := tracked.totalEndpoints
-	tracked.totalEndpoints = 0
+	// delete
+	for _, toDelete := range deleteTestData {
+		delete(testData, toDelete)
+		err := bpfDeleteServiceNameKey(toDelete)
+		if err != nil {
+			t.Fatalf("failed to delete service %v with err %v", toDelete, err)
+		}
+	}
 
-	err = bpfUpdateServiceAffinity(tracked, 20)
-	assert.NoErrorf(err, "failed to update service affinity info %v", err)
+	// re-get all and compare
+	allServiceNamekey, err = bpfGetAllServiceNameKey()
+	if err != nil {
+		t.Fatalf("failed to get all services namekey with error %v", err)
+	}
 
-	assert.Equal(oldcount, tracked.totalEndpoints, "affinity update should automatically load the endpoint count")
+	comparer(testData, allServiceNamekey)
+
+}
+
+func TestServiceInfo(t *testing.T) {
+
+	testData := map[uint64]*trackedService{
+		1: &trackedService{
+			affinitySec:    11,
+			totalEndpoints: 11,
+		},
+		2: &trackedService{
+			affinitySec:    12,
+			totalEndpoints: 12,
+		},
+		3: &trackedService{
+			affinitySec:    13,
+			totalEndpoints: 13,
+		},
+		4: &trackedService{
+			affinitySec:    14,
+			totalEndpoints: 14,
+		},
+		5: &trackedService{
+			affinitySec:    15,
+			totalEndpoints: 15,
+		},
+	}
+
+	toDeleteBpfIds := []uint64{1, 3}
+	compareTracked := func(expected, got *trackedService) {
+		t.Helper()
+		if expected.affinitySec != got.affinitySec ||
+			expected.bpfId != got.bpfId ||
+			expected.namespaceName != got.namespaceName ||
+			expected.totalEndpoints != got.totalEndpoints {
+			t.Fatalf("expected(%+v)!=got(%+v)", expected, got)
+		}
+	}
+
+	compareAll := func(expected, got map[uint64]*trackedService) {
+		t.Helper()
+		if len(expected) != len(got) {
+			t.Fatalf("len(expected)!=len(got) %v!=%v %+v", len(expected), len(got), got)
+		}
+		for expectedKey, expectedVal := range expected {
+			gotVal, ok := got[expectedKey]
+			if !ok {
+				t.Fatalf("expected to find key %v in %+v", expectedKey, got)
+			}
+
+			compareTracked(expectedVal, gotVal)
+		}
+	}
+	// insert
+	for bpfId, tracked := range testData {
+		tracked.bpfId = bpfId
+		err := bpfInsertOrUpdateServiceInfo(tracked)
+		if err != nil {
+			t.Fatalf("failed to insert %+v with error:%v", tracked, err)
+		}
+	}
+
+	// get one by one
+	for bpfId, tracked := range testData {
+		gotTracked, err := bpfGetServiceInfo(bpfId)
+		if err != nil {
+			t.Fatalf("failed to get service with id:%v err:%v", bpfId, err)
+		}
+
+		if gotTracked == nil {
+			t.Fatalf("failed to get service with id:%v", bpfId)
+		}
+
+		compareTracked(tracked, gotTracked)
+	}
+
+	// get all and compare
+	allInfos, err := bpfGetAllServiceInfos()
+	if err != nil {
+		t.Fatalf("failed to get all service infos with err :%v", err)
+	}
+	compareAll(testData, allInfos)
+
+	// delete
+	for _, bpfId := range toDeleteBpfIds {
+		delete(testData, bpfId)
+		err := bpfDeleteServiceInfo(bpfId)
+		if err != nil {
+			t.Fatalf("failed to delete service with bpfId:%v with err:%v", bpfId, err)
+		}
+	}
+
+	// get all and compare
+	allInfos, err = bpfGetAllServiceInfos()
+	if err != nil {
+		t.Fatalf("failed to get all service infos with err :%v", err)
+	}
+	compareAll(testData, allInfos)
 }
 
 func TestServiceToBackendPorts(t *testing.T) {
-	assert := assert.New(t)
-	serviceName := "namespace/service"
-
-	tracked := &trackedService{
-		namespaceName:  serviceName,
-		affinitySec:    10,
-		totalEndpoints: 10,
-		bpfId:          123456,
-	}
-
-	err := bpfInsertOrUpdateServiceInfo(tracked)
-	assert.NoErrorf(err, "failed to insert service info with error %v", err)
+	bpfId := uint64(123456)
 
 	portMapByProto := map[uint8]map[uint16]uint16{
 		uint8(1): map[uint16]uint16{270: 7270, 280: 8280, 290: 9290},
@@ -70,15 +188,15 @@ func TestServiceToBackendPorts(t *testing.T) {
 	// insert all ports
 	for proto, portMap := range portMapByProto {
 		for fromPort, toPort := range portMap {
-			err := bpfInsertOrUpdateServiceToBackendPort(tracked.bpfId, proto, fromPort, toPort)
+			err := bpfInsertOrUpdateServiceToBackendPort(bpfId, proto, fromPort, toPort)
 			if err != nil {
-				t.Fatalf("failed to insert port bpfId:%v proto:%v from:%v to :%v err:%v", tracked.bpfId, proto, fromPort, toPort, err)
+				t.Fatalf("failed to insert port bpfId:%v proto:%v from:%v to :%v err:%v", bpfId, proto, fromPort, toPort, err)
 			}
 		}
 	}
 
 	// compare what was saved to what we have
-	savedPortMapByProto, err := bpfGetServiceToBackendPorts(tracked.bpfId)
+	savedPortMapByProto, err := bpfGetServiceToBackendPorts(bpfId)
 	if err != nil {
 		t.Fatalf("failed to get service to backend ports %v", err)
 	}
@@ -87,7 +205,7 @@ func TestServiceToBackendPorts(t *testing.T) {
 	// let us get them one by one and make sure that they are there
 	for proto, portMap := range portMapByProto {
 		for fromPort, toPort := range portMap {
-			savedToPort, err := bpfGetServiceToBackendPort(tracked.bpfId, proto, fromPort)
+			savedToPort, err := bpfGetServiceToBackendPort(bpfId, proto, fromPort)
 			if err != err {
 				t.Fatalf("unexpected error getting backendport for a serviceport: %v", err)
 			}
@@ -102,7 +220,7 @@ func TestServiceToBackendPorts(t *testing.T) {
 	for proto, fromPorts := range portsToDelete {
 		for _, fromPort := range fromPorts {
 			// delete from bpf map
-			err := bpfDeleteServiceToBackendPort(tracked.bpfId, proto, fromPort)
+			err := bpfDeleteServiceToBackendPort(bpfId, proto, fromPort)
 			if err != nil {
 				t.Fatalf("failed to delete port with error %v", err)
 			}
@@ -112,7 +230,7 @@ func TestServiceToBackendPorts(t *testing.T) {
 		}
 	}
 	// now let us re-get and compare
-	savedPortMapByProto, err = bpfGetServiceToBackendPorts(tracked.bpfId)
+	savedPortMapByProto, err = bpfGetServiceToBackendPorts(bpfId)
 	if err != nil {
 		t.Fatalf("failed to get service to backend ports %v", err)
 	}
@@ -120,18 +238,7 @@ func TestServiceToBackendPorts(t *testing.T) {
 }
 
 func TestBackendToServicePorts(t *testing.T) {
-	assert := assert.New(t)
-	serviceName := "namespace/service"
-
-	tracked := &trackedService{
-		namespaceName:  serviceName,
-		affinitySec:    10,
-		totalEndpoints: 10,
-		bpfId:          123456,
-	}
-
-	err := bpfInsertOrUpdateServiceInfo(tracked)
-	assert.NoErrorf(err, "failed to insert service info with error %v", err)
+	bpfId := uint64(1234567)
 
 	portMapByProto := map[uint8]map[uint16]uint16{
 		uint8(1): map[uint16]uint16{7270: 270, 8280: 280, 9290: 290},
@@ -148,15 +255,15 @@ func TestBackendToServicePorts(t *testing.T) {
 	// insert all ports
 	for proto, portMap := range portMapByProto {
 		for fromPort, toPort := range portMap {
-			err := bpfInsertOrUpdateBackendToServicePort(tracked.bpfId, proto, fromPort, toPort)
+			err := bpfInsertOrUpdateBackendToServicePort(bpfId, proto, fromPort, toPort)
 			if err != nil {
-				t.Fatalf("failed to insert port bpfId:%v proto:%v from:%v to :%v err:%v", tracked.bpfId, proto, fromPort, toPort, err)
+				t.Fatalf("failed to insert port bpfId:%v proto:%v from:%v to :%v err:%v", bpfId, proto, fromPort, toPort, err)
 			}
 		}
 	}
 
 	// compare what was saved to what we have
-	savedPortMapByProto, err := bpfGetBackEndToServicePorts(tracked.bpfId)
+	savedPortMapByProto, err := bpfGetBackEndToServicePorts(bpfId)
 	if err != nil {
 		t.Fatalf("failed to get service to backend ports %v", err)
 	}
@@ -165,7 +272,7 @@ func TestBackendToServicePorts(t *testing.T) {
 	// let us get them one by one and make sure that they are there
 	for proto, portMap := range portMapByProto {
 		for fromPort, toPort := range portMap {
-			savedToPort, err := bpfGetBackendToServicePort(tracked.bpfId, proto, fromPort)
+			savedToPort, err := bpfGetBackendToServicePort(bpfId, proto, fromPort)
 			if err != err {
 				t.Fatalf("unexpected error getting backendport for a serviceport: %v", err)
 			}
@@ -180,7 +287,7 @@ func TestBackendToServicePorts(t *testing.T) {
 	for proto, fromPorts := range portsToDelete {
 		for _, fromPort := range fromPorts {
 			// delete from bpf map
-			err := bpfDeleteBackendToServicePort(tracked.bpfId, proto, fromPort)
+			err := bpfDeleteBackendToServicePort(bpfId, proto, fromPort)
 			if err != nil {
 				t.Fatalf("failed to delete port with error %v", err)
 			}
@@ -190,7 +297,7 @@ func TestBackendToServicePorts(t *testing.T) {
 		}
 	}
 	// now let us re-get and compare
-	savedPortMapByProto, err = bpfGetBackEndToServicePorts(tracked.bpfId)
+	savedPortMapByProto, err = bpfGetBackEndToServicePorts(bpfId)
 	if err != nil {
 		t.Fatalf("failed to get service to backend ports %v", err)
 	}
@@ -198,6 +305,7 @@ func TestBackendToServicePorts(t *testing.T) {
 }
 
 func comparePortMaps(t *testing.T, expected, saved map[uint8]map[uint16]uint16) {
+	t.Helper()
 	if len(expected) != len(saved) {
 		t.Fatalf("saved number of protos:%v != expected:%v", len(saved), len(expected))
 	}
@@ -250,14 +358,7 @@ func TestIPRoundTripper(t *testing.T) {
 
 func TestServiceIPs(t *testing.T) {
 	//	assert := assert.New(t)
-	serviceName := "namespace/service"
-
-	tracked := &trackedService{
-		namespaceName:  serviceName,
-		affinitySec:    10,
-		totalEndpoints: 10,
-		bpfId:          123456,
-	}
+	bpfId := uint64(1234569)
 
 	testData := []net.IP{
 		net.ParseIP("1.2.3.4"),
@@ -274,16 +375,31 @@ func TestServiceIPs(t *testing.T) {
 		net.ParseIP("172.16.0.2"),
 		net.ParseIP("2000::1"),
 	}
+
+	// delete all
+	allServiceIPs, err := bpfGetAllServiceIPs()
+	if err != nil {
+		t.Fatalf("failed to get all service IPs with err:%v", err)
+	}
+	for bpfId, serviceIPs := range allServiceIPs {
+		for _, serviceIP := range serviceIPs {
+			err := bpfDeleteServiceIP(bpfId, serviceIP)
+			if err != nil {
+				t.Fatalf("failed to delete service IP %v for %v with err %v", serviceIP, bpfId, err)
+			}
+		}
+	}
+
 	// insertion test
 	for _, ip := range testData {
-		err := bpfInsertOrUpdateServiceIP(tracked.bpfId, ip)
+		err := bpfInsertOrUpdateServiceIP(bpfId, ip)
 		if err != nil {
 			t.Fatalf("failed to insert service ip:%v with error:%v", ip, err)
 		}
 	}
 
 	// read them
-	savedServiceIPs, err := bpfGetServiceIPs(tracked.bpfId)
+	savedServiceIPs, err := bpfGetServiceIPs(bpfId)
 	if err != nil {
 		t.Fatalf("failed to get service IPs with error:%v", err)
 	}
@@ -296,7 +412,7 @@ func TestServiceIPs(t *testing.T) {
 		add := true
 		for _, toDeleteIP := range ipsToDelete {
 			if currentIP.String() == toDeleteIP.String() {
-				err := bpfDeleteServiceIP(tracked.bpfId, toDeleteIP)
+				err := bpfDeleteServiceIP(bpfId, toDeleteIP)
 				if err != nil {
 					t.Fatalf("failed to delete ip:%v with err:%v", toDeleteIP, err)
 				}
@@ -306,10 +422,10 @@ func TestServiceIPs(t *testing.T) {
 		if add {
 			filtered = append(filtered, currentIP)
 		}
-
 	}
+
 	// get and recompare
-	savedServiceIPs, err = bpfGetServiceIPs(tracked.bpfId)
+	savedServiceIPs, err = bpfGetServiceIPs(bpfId)
 	if err != nil {
 		t.Fatalf("failed to get service IPs with error:%v", err)
 	}
@@ -318,15 +434,7 @@ func TestServiceIPs(t *testing.T) {
 }
 
 func TestBackendIPs(t *testing.T) {
-	//	assert := assert.New(t)
-	serviceName := "namespace/service"
-
-	tracked := &trackedService{
-		namespaceName:  serviceName,
-		affinitySec:    10,
-		totalEndpoints: 10,
-		bpfId:          123456,
-	}
+	bpfId := uint64(123458)
 
 	testData := []net.IP{
 		net.ParseIP("1.2.3.4"),
@@ -345,14 +453,14 @@ func TestBackendIPs(t *testing.T) {
 	}
 	// insertion test
 	for _, ip := range testData {
-		err := bpfInsertOrUpdateBackendToService(tracked.bpfId, ip)
+		err := bpfInsertOrUpdateBackendToService(bpfId, ip)
 		if err != nil {
 			t.Fatalf("failed to insert service ip:%v with error:%v", ip, err)
 		}
 	}
 
 	// read them
-	savedBackendIPs, err := bpfGetBackendsToService(tracked.bpfId)
+	savedBackendIPs, err := bpfGetBackendsToService(bpfId)
 	if err != nil {
 		t.Fatalf("failed to get service IPs with error:%v", err)
 	}
@@ -365,7 +473,7 @@ func TestBackendIPs(t *testing.T) {
 		add := true
 		for _, toDeleteIP := range ipsToDelete {
 			if currentIP.String() == toDeleteIP.String() {
-				err := bpfDeleteBackendToService(tracked.bpfId, toDeleteIP)
+				err := bpfDeleteBackendToService(bpfId, toDeleteIP)
 				if err != nil {
 					t.Fatalf("failed to delete ip:%v with err:%v", toDeleteIP, err)
 				}
@@ -378,7 +486,7 @@ func TestBackendIPs(t *testing.T) {
 
 	}
 	// get and recompare
-	savedBackendIPs, err = bpfGetBackendsToService(tracked.bpfId)
+	savedBackendIPs, err = bpfGetBackendsToService(bpfId)
 	if err != nil {
 		t.Fatalf("failed to get service IPs with error:%v", err)
 	}
@@ -682,6 +790,7 @@ func TestAffinity(t *testing.T) {
 	}
 
 	verifier := func(expected []affinity, got []affinity) {
+		t.Helper()
 		if len(expected) != len(got) {
 			t.Fatalf("expected and got are not the same length %v!=%v", len(expected), len(got))
 		}
@@ -697,6 +806,20 @@ func TestAffinity(t *testing.T) {
 			}
 			if !found {
 				t.Fatalf("failed to find flow %v in %v", expectedOne, got)
+			}
+		}
+	}
+
+	// must clear affinities
+	allAff, err := bpfGetAllAffinities()
+	if err != nil {
+		t.Fatalf("failed to clear affs with err:%v", err)
+	}
+	for bpfId, affs := range allAff {
+		for _, aff := range affs {
+			err := bpfDeleteAffinity(bpfId, aff.clientIP)
+			if err != nil {
+				t.Fatalf("failed to clear affs for %v with err:%v", bpfId, err)
 			}
 		}
 	}
@@ -721,7 +844,7 @@ func TestAffinity(t *testing.T) {
 	}
 
 	// get all
-	allAff, err := bpfGetAllAffinities()
+	allAff, err = bpfGetAllAffinities()
 	if err != nil {
 		t.Fatalf("failed to get affinities with err:%v", err)
 	}

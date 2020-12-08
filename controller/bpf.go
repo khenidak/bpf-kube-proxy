@@ -504,95 +504,6 @@ func bpfDeleteBackendToService(bpfId uint64, ip net.IP) error {
 }
 
 // gets service info
-func bpfGetServiceInfo(namespaceName string) (*trackedService, error) {
-	mapServiceNameKey, err := bpfGetMap(map_path_service_name_key)
-	if err != nil {
-		return nil, err
-	}
-
-	mapServices, err := bpfGetMap(map_path_services)
-	if err != nil {
-		return nil, err
-	}
-
-	bpfServiceIdAsBytes, err := mapServiceNameKey.Lookup(namespaceName)
-	if err != nil {
-		return nil, err
-	}
-
-	bpfServiceId := *(*uint64)(unsafe.Pointer(&bpfServiceIdAsBytes[0]))
-
-	serviceAsBytes, err := mapServices.Lookup(bpfServiceId)
-	if err != nil {
-		return nil, err
-	}
-
-	bpfService := (*C.struct_kbpf_service)(unsafe.Pointer(&serviceAsBytes[0]))
-
-	return &trackedService{
-		namespaceName:  namespaceName,
-		bpfId:          bpfServiceId,
-		affinitySec:    uint16(bpfService.has_affinity),
-		totalEndpoints: uint16(bpfService.has_affinity),
-	}, nil
-}
-
-// updates service affinity
-func bpfUpdateServiceAffinity(tracked *trackedService, newAffinity uint16) error {
-	if tracked.affinitySec == newAffinity {
-		return nil
-	}
-
-	if tracked.totalEndpoints == 0 {
-		saved, err := bpfGetServiceInfo(tracked.namespaceName)
-		if err != nil {
-			return err
-		}
-
-		tracked.totalEndpoints = saved.totalEndpoints
-	}
-
-	return bpfInsertOrUpdateServiceInfo(tracked)
-}
-
-// inserts service info
-func bpfInsertOrUpdateServiceInfo(tracked *trackedService) error {
-	mapServiceNameKey, err := bpfGetMap(map_path_service_name_key)
-	if err != nil {
-		return err
-	}
-
-	mapServices, err := bpfGetMap(map_path_services)
-	if err != nil {
-		return err
-	}
-
-	err = mapServiceNameKey.Upsert(tracked.namespaceName, tracked.bpfId)
-	if err != nil {
-		return err
-	}
-
-	bpfService := C.struct_kbpf_service{
-		key:             C.ulong(tracked.bpfId),
-		total_endpoints: C.ushort(tracked.totalEndpoints),
-		has_affinity:    C.ushort(tracked.affinitySec),
-	}
-
-	// if we go beyond 512 goebpf pkg will catch it
-	// we have to test on creation of tracked service
-	buff := make([]byte, len(tracked.namespaceName), len(tracked.namespaceName))
-	C.memcpy(unsafe.Pointer(&buff[0]), unsafe.Pointer(&tracked.namespaceName), C.ulong(len(tracked.namespaceName)))
-
-	err = mapServiceNameKey.Upsert(buff, tracked.bpfId)
-	if err != nil {
-		return err
-	}
-
-	buff = make([]byte, C.sizeof_struct_kbpf_service, C.sizeof_struct_kbpf_service)
-	C.memcpy(unsafe.Pointer(&buff[0]), unsafe.Pointer(&bpfService), C.sizeof_struct_kbpf_service)
-
-	return mapServices.Upsert(tracked.bpfId, buff)
-}
 
 func bpfInsertOrUpdateServiceIP(bpfId uint64, ip net.IP) error {
 	mapServiceIPs, err := bpfGetMap(map_path_service_ips_to_service)
@@ -607,7 +518,15 @@ func bpfInsertOrUpdateServiceIP(bpfId uint64, ip net.IP) error {
 }
 
 func bpfGetServiceIPs(bpfId uint64) ([]net.IP, error) {
-	all := make([]net.IP, 0)
+	all, err := bpfGetAllServiceIPs()
+	if err != nil {
+		return nil, err
+	}
+
+	return all[bpfId], nil
+}
+func bpfGetAllServiceIPs() (map[uint64][]net.IP, error) {
+	all := make(map[uint64][]net.IP)
 	mapServiceIPs, err := bpfGetMap(map_path_service_ips_to_service)
 	if err != nil {
 		return nil, err
@@ -630,11 +549,11 @@ func bpfGetServiceIPs(bpfId uint64) ([]net.IP, error) {
 		}
 
 		savedBpfId := *(*uint64)(unsafe.Pointer(&buffBpfId[0]))
-
-		if savedBpfId == bpfId {
-			thisKey := *(*C.struct_kbpf_ip)(unsafe.Pointer(&buff[0]))
-			all = append(all, kbpfIPToIP(&thisKey))
+		thisKey := *(*C.struct_kbpf_ip)(unsafe.Pointer(&buff[0]))
+		if _, ok := all[savedBpfId]; !ok {
+			all[savedBpfId] = make([]net.IP, 0)
 		}
+		all[savedBpfId] = append(all[savedBpfId], kbpfIPToIP(&thisKey))
 	}
 
 	return all, nil
@@ -841,6 +760,185 @@ func isIPv6(ip net.IP) bool {
 	return ip != nil && ip.To4() == nil
 }
 
-//TODO
-// Service backends
-// flows and affinities
+func bpfGetAllServiceNameKey() (map[string]uint64, error) {
+	all := make(map[string]uint64)
+
+	mapServicesNameKey, err := bpfGetMap(map_path_service_name_key)
+	if err != nil {
+		return all, err
+	}
+
+	buffName := make([]byte, kbpf_service_name_length, kbpf_service_name_length)
+	C.memset(unsafe.Pointer(&buffName[0]), 0, kbpf_service_name_length)
+
+	for {
+		buffName, err = mapServicesNameKey.GetNextKey(buffName)
+		if err != nil {
+			return all, nil // error is returned when last key is read. // TODO find a better way
+		}
+
+		if len(buffName) == 0 {
+			return all, nil
+		}
+
+		buffBpfId, err := mapServicesNameKey.Lookup(buffName)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(buffBpfId) == 0 {
+			return all, nil
+		}
+
+		// find null byte
+		idx := len(buffName) - 1
+		for i, b := range buffName {
+			if b == 0 {
+				idx = i
+				break
+			}
+		}
+
+		newBuff := buffName[:idx]
+
+		bpfServiceName := string(newBuff)
+		bpfServiceId := *(*uint64)(unsafe.Pointer(&buffBpfId[0]))
+
+		all[bpfServiceName] = bpfServiceId
+	}
+
+	return all, nil
+}
+func bpfGetServiceKeyByName(name string) (uint64, error) {
+	mapServiceNameKey, err := bpfGetMap(map_path_service_name_key)
+	if err != nil {
+		return 0, err
+	}
+
+	buffKey, err := mapServiceNameKey.Lookup(name)
+	if err != nil {
+		return 0, err
+	}
+
+	if len(buffKey) == 0 {
+		return 0, nil
+	}
+
+	key := *(*uint64)(unsafe.Pointer(&buffKey[0]))
+	return key, nil
+}
+
+func bpfInsertOrUpdateServiceNameKey(name string, key uint64) error {
+	mapServiceNameKey, err := bpfGetMap(map_path_service_name_key)
+	if err != nil {
+		return err
+	}
+
+	return mapServiceNameKey.Upsert(name, key)
+}
+
+func bpfDeleteServiceNameKey(name string) error {
+	mapServiceNameKey, err := bpfGetMap(map_path_service_name_key)
+	if err != nil {
+		return err
+	}
+
+	return mapServiceNameKey.Delete(name)
+}
+
+func bpfGetServiceInfo(bpfId uint64) (*trackedService, error) {
+
+	mapServices, err := bpfGetMap(map_path_services)
+	if err != nil {
+		return nil, err
+	}
+
+	serviceAsBytes, err := mapServices.Lookup(bpfId)
+	if err != nil {
+		return nil, err
+	}
+
+	bpfService := (*C.struct_kbpf_service)(unsafe.Pointer(&serviceAsBytes[0]))
+
+	return &trackedService{
+		bpfId:          bpfId,
+		affinitySec:    uint16(bpfService.has_affinity),
+		totalEndpoints: uint16(bpfService.has_affinity),
+	}, nil
+}
+
+// returns a list of tracked services, does not fill
+// namespaceName
+func bpfGetAllServiceInfos() (map[uint64]*trackedService, error) {
+	allTracked := make(map[uint64]*trackedService)
+
+	mapServices, err := bpfGetMap(map_path_services)
+	if err != nil {
+		return allTracked, err
+	}
+
+	buffBpfId := make([]byte, 8, 8)
+	C.memset(unsafe.Pointer(&buffBpfId[0]), 0, 8)
+
+	for {
+		buffBpfId, err = mapServices.GetNextKey(buffBpfId)
+
+		if err != nil {
+			return allTracked, nil // error is returned when last key is read. // TODO find a better way
+		}
+
+		if len(buffBpfId) == 0 {
+			return allTracked, nil
+		}
+
+		buffservice, err := mapServices.Lookup(buffBpfId)
+		if err != nil {
+			return nil, err
+		}
+
+		if len(buffservice) == 0 {
+			continue
+		}
+
+		bpfServiceId := *(*uint64)(unsafe.Pointer(&buffBpfId[0]))
+		bpfService := (*C.struct_kbpf_service)(unsafe.Pointer(&buffservice[0]))
+
+		t := &trackedService{
+			bpfId:          bpfServiceId,
+			affinitySec:    uint16(bpfService.has_affinity),
+			totalEndpoints: uint16(bpfService.has_affinity),
+		}
+
+		allTracked[bpfServiceId] = t
+	}
+
+	return allTracked, nil
+}
+
+// inserts service info
+func bpfInsertOrUpdateServiceInfo(tracked *trackedService) error {
+	mapServices, err := bpfGetMap(map_path_services)
+	if err != nil {
+		return err
+	}
+
+	bpfService := C.struct_kbpf_service{
+		key:             C.ulong(tracked.bpfId),
+		total_endpoints: C.ushort(tracked.totalEndpoints),
+		has_affinity:    C.ushort(tracked.affinitySec),
+	}
+
+	buff := make([]byte, C.sizeof_struct_kbpf_service, C.sizeof_struct_kbpf_service)
+	C.memcpy(unsafe.Pointer(&buff[0]), unsafe.Pointer(&bpfService), C.sizeof_struct_kbpf_service)
+
+	return mapServices.Upsert(tracked.bpfId, buff)
+}
+
+func bpfDeleteServiceInfo(bpfId uint64) error {
+	mapServices, err := bpfGetMap(map_path_services)
+	if err != nil {
+		return err
+	}
+
+	return mapServices.Delete(bpfId)
+}

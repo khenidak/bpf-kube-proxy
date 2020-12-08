@@ -3,7 +3,7 @@ package controller
 type Controller interface {
 	// TrackService adds service to the tracked list of service
 	// TrackService can be called for the same service multiple times
-	TrackService(namespaceName string, affinitySec int) error
+	//	TrackService(namespaceName string, affinitySec uint16) error
 	/*
 		// SyncServiceIPs synchronizes the list of ips {clusterIPs, externalIPs, LB IPs}
 		// that this service listens

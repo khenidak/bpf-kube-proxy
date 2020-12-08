@@ -10,6 +10,10 @@ import (
 	// "net"
 )
 
+const min_flow_expiration_sec = 5
+const max_flow_expiration_sec = 20
+const default_flow_expiration_sec = 7
+
 type trackedService struct {
 	mu             sync.Mutex
 	bpfId          uint64 // bpf operates on a smaller id not name, to avoid bigger stack
@@ -18,10 +22,187 @@ type trackedService struct {
 	affinitySec    uint16
 }
 type ctrl struct {
-	servicesMu sync.Mutex
-	services   map[string]*trackedService
+	servicesMu            sync.Mutex
+	services              map[string]*trackedService
+	flowExpireDurationSec uint8
+	logWrite              func(format string, a ...interface{})
 }
 
+func NewController(logWriter func(format string, a ...interface{}), flowExpireDurationSec uint8) (Controller, error) {
+	c := &ctrl{}
+
+	// set flow expiration
+	if flowExpireDurationSec > max_flow_expiration_sec ||
+		flowExpireDurationSec < max_flow_expiration_sec {
+		flowExpireDurationSec = default_flow_expiration_sec
+	}
+
+	// note:
+	// for affinity we delete them iif
+	// affinity expired (per service)
+	// service removed
+	c.services = make(map[string]*trackedService)
+	c.logWrite = logWriter
+	c.flowExpireDurationSec = flowExpireDurationSec
+	err := c.buildInternalData()
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO: start affinity and flows loops
+	return c, nil
+
+}
+
+// data in maps can go slightly out of drift
+// entries that no longer valid due to failed partial delete or insert
+// this func make sure that the data in all maps are linked correctly
+// to source of truth (name/key map)
+func (c *ctrl) buildInternalData() error {
+	c.logWrite("begin internal data sync")
+	defer c.logWrite("end internal data sync")
+
+	c.servicesMu.Lock()
+	defer c.servicesMu.Unlock()
+
+	allNameKeys, err := bpfGetAllServiceNameKey()
+	if err != nil {
+		return err
+	}
+
+	allServiceInfos, err := bpfGetAllServiceInfos()
+	if err != nil {
+		return err
+	}
+
+	// create a clean list of all name/keys
+	// that map to infos. for orphan infos.. delete them
+	for bpfId, tracked := range allServiceInfos {
+		// because nameKeys is keyed using name, we will have to do it
+		// this way
+		for name, key := range allNameKeys {
+			if key == bpfId {
+				// set the name
+				c.logWrite("bpid=>name %v=>%v", bpfId, name)
+				tracked.namespaceName = name
+			}
+		}
+		if tracked.namespaceName == "" {
+			c.logWrite("service %+v is not in name/key mapping (orphaned).. removing", tracked)
+			err := bpfDeleteServiceInfo(bpfId)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		// servic has key and name.. keep
+		c.services[tracked.namespaceName] = tracked
+	}
+
+	// remove the rest of orphans
+	if err := c.removeOrphanedServiceIPs(); err != nil {
+		return err
+	}
+
+	if err := c.removeOrphanedFlows(); err != nil {
+		return err
+	}
+	if err := c.removeOrphanedAffinities(); err != nil {
+		return err
+	}
+
+	// TODO: loader
+	// get All Services
+	// for each of the sub data itemsp:
+	// ports
+	// backend ends
+	// indexed back end
+	// flows
+	// affinities
+	// if service key does not exist.. delete it
+
+	return nil
+}
+
+func (c *ctrl) removeOrphanedServiceIPs() error {
+	// remove orphan flows
+	allServiceIPs, err := bpfGetAllServiceIPs()
+	if err != nil {
+		return err
+	}
+
+	for bpfId, serviceIPs := range allServiceIPs {
+		if !c.hasTrackedServiceByBpfId(bpfId) {
+			c.logWrite("serviceIPs for service %v are orphaned, deleting", bpfId)
+			for _, serviceIP := range serviceIPs {
+				err := bpfDeleteServiceIP(bpfId, serviceIP)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (c *ctrl) removeOrphanedFlows() error {
+	// remove orphan flows
+	allFlows, err := bpfGetAllFlows()
+	if err != nil {
+		return err
+	}
+
+	for bpfId, flows := range allFlows {
+		if !c.hasTrackedServiceByBpfId(bpfId) {
+			c.logWrite("flows for service %v are orphaned, deleting", bpfId)
+			for _, flow := range flows {
+				err := bpfDeleteFlow(bpfId, flow.srcIP, flow.srcPort, flow.l4_proto)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (c *ctrl) removeOrphanedAffinities() error {
+	// remove orphan flows
+	allAff, err := bpfGetAllAffinities()
+	if err != nil {
+		return err
+	}
+
+	for bpfId, affs := range allAff {
+		if !c.hasTrackedServiceByBpfId(bpfId) {
+			c.logWrite("affinities for service %v are orphaned, deleting", bpfId)
+			for _, aff := range affs {
+				err := bpfDeleteAffinity(bpfId, aff.clientIP)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (c *ctrl) hasTrackedServiceByBpfId(bpfId uint64) bool {
+	return (c.getTrackedServiceByBpfId(bpfId) != nil)
+}
+func (c *ctrl) getTrackedServiceByBpfId(bpfId uint64) *trackedService {
+	for _, tracked := range c.services {
+		if tracked.bpfId == bpfId {
+			return tracked
+		}
+	}
+	return nil
+}
+
+/*
 func (c *ctrl) TrackService(namespaceName string, affinitySec uint16) error {
 	c.servicesMu.Lock()
 	defer c.servicesMu.Unlock()
@@ -67,7 +248,7 @@ func (c *ctrl) TrackService(namespaceName string, affinitySec uint16) error {
 
 	return nil
 }
-
+*/
 /*
 // SyncServiceIPs synchronizes the list of ips {clusterIPs, externalIPs, LB IPs}
 // that this service listens
