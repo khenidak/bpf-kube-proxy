@@ -98,6 +98,7 @@ func TestServiceInfo(t *testing.T) {
 		},
 	}
 
+	clearAll(t)
 	toDeleteBpfIds := []uint64{1, 3}
 	compareTracked := func(expected, got *trackedService) {
 		t.Helper()

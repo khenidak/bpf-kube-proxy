@@ -1,20 +1,19 @@
 package controller
 
 type Controller interface {
-	// TrackService adds service to the tracked list of service
-	// TrackService can be called for the same service multiple times
-	//	TrackService(namespaceName string, affinitySec uint16) error
-	/*
-		// SyncServiceIPs synchronizes the list of ips {clusterIPs, externalIPs, LB IPs}
-		// that this service listens
-		SyncServiceIPs(namespaceName string, ips []string) error
+	// AddService adds a service to tracked list of services.
+	// AddService can be called multiple times for the same service.
+	AddService(namespaceName string, affinitySec uint16) error
 
-		// SyncServicePorts maps service port to an endpoint port
-		SyncServicePorts(namespaceName string, ports map[int16]int16) error
-		// SyncServiceEndpoints synchronizes the list of endpoints backing this service
-		SyncServiceEndpoints(namespaceName string, endpoints []string) error
-		// UntrackService removes all data related to this service
-		UntrackService(namespaceName string)
-		Stop()
-	*/
+	// SyncServiceIPs sync a list of ips for a service.
+	// it adds new ips that are not currently part of the service ip list
+	// it removes ips that are no longer part of ot the service ip list
+	SyncServiceIPs(namespaceName string, ips []string) []error
+
+	// SyncServicePorts syns list of ports used by this service. The expected input is
+	// map[TCP||UDP||SCTP] of map[from-service-port]=>pod-port
+	SyncServicePorts(namespaceName string, ports map[string]map[uint16]uint16) []error
+
+	// used only for testing
+	GetServiceBpfId(namespaceName string) uint64
 }

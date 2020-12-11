@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"fmt"
 	"net"
 	"testing"
 )
@@ -8,6 +9,9 @@ import (
 // clears all the state (service top level name/key and ids)
 func clearAll(t *testing.T) {
 	t.Helper()
+	// delete name->mapping
+	// create a controller which automatically clears everything else
+	// because it treats name->key as source of truth
 	allNameKey, err := bpfGetAllServiceNameKey()
 	if err != nil {
 		t.Fatalf("failed tp delete name/keys %v", err)
@@ -19,6 +23,11 @@ func clearAll(t *testing.T) {
 			t.Fatalf("failed to delete name,key with err:%v", err)
 		}
 	}
+	_, err = NewController(t.Logf, 10)
+	if err != nil {
+		t.Fatalf("failed to clear data with err %v", err)
+	}
+
 }
 
 func TestControllerCreate(t *testing.T) {
@@ -332,5 +341,160 @@ func TestControllerCreate(t *testing.T) {
 	}
 	for bpfId, _ := range gotIndexedBackends {
 		confirmBpfId(bpfId)
+	}
+}
+
+func TestSyncServiceIPs(t *testing.T) {
+	serviceName := "namespace1/service1"
+	serviceAffinity := uint16(0)
+
+	testServiceIPs := map[string][]string{
+		"r1": {
+			"10.0.1.10",
+			"10.0.1.11", // will be deleted
+			"10.0.1.12",
+		},
+		"r2": {
+			"10.0.0.20", // changed
+			"10.1.1.12",
+		},
+	}
+
+	c, err := NewController(t.Logf, 10)
+	if err != nil {
+		t.Fatalf("failed to create controller with err:%v", err)
+	}
+
+	compareIPSlices := func(with []string) {
+		t.Helper()
+
+		currentIPs, err := bpfGetServiceIPs(c.GetServiceBpfId(serviceName))
+		failIfNeeded(t, []error{err}, "failed to read service IPS")
+		if len(with) != len(currentIPs) {
+			t.Fatalf("expected service ips != current service ips %+v!=%+v", with, currentIPs)
+		}
+		for _, ip := range with {
+			found := false
+			for _, currentIP := range currentIPs {
+				if currentIP.String() == ip {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("expected service ips != current service ips %+v!=%+v", with, currentIPs)
+
+			}
+		}
+	}
+
+	err = c.AddService(serviceName, serviceAffinity)
+	if err != nil {
+		t.Fatalf("failed to create service with err %v", err)
+	}
+
+	for roundName, ips := range testServiceIPs {
+		// first round
+		errs := c.SyncServiceIPs(serviceName, ips)
+		failIfNeeded(t, errs, fmt.Sprintf("failed to sync service ips %v:%v", roundName, ips))
+		compareIPSlices(ips)
+	}
+}
+
+func TestSyncPorts(t *testing.T) {
+	serviceName := "namespace1/service1"
+	serviceAffinity := uint16(0)
+
+	c, err := NewController(t.Logf, 10)
+	if err != nil {
+		t.Fatalf("failed to create controller with err:%v", err)
+	}
+
+	rounds := map[string]map[string]map[uint16]uint16{
+		"round1": {
+			"TCP": {
+				80: 8080,
+				90: 9090,
+			},
+			"uDP": {
+				60: 6060,
+				50: 5060,
+			},
+			"SCTP": {
+				40: 4040,
+				30: 3030,
+			},
+		},
+		"round2": {
+			/* missing tcp is on purpose */
+			"UDP": {
+				61: 6160,
+			},
+			"ScTP": {
+				40: 4040,
+				31: 3130,
+			},
+		},
+	}
+
+	clearAll(t)
+
+	err = c.AddService(serviceName, serviceAffinity)
+	if err != nil {
+		t.Fatalf("failed to create service with err %v", err)
+	}
+
+	comparePortList := func(source, with map[uint16]uint16, invert bool) {
+		if !invert {
+			for from, to := range source {
+				if withTo, ok := with[from]; !ok || withTo != to {
+					t.Fatalf("failed to find port [%v:%v]", from, to)
+				}
+			}
+			return
+		}
+		// inverted
+		for from, to := range source {
+			if withFrom, ok := with[to]; !ok || withFrom != from {
+				t.Fatalf("failed to find port [%v:%v]", from, to)
+			}
+		}
+	}
+
+	comparePorts := func(with map[string]map[uint16]uint16) {
+		t.Helper()
+		t.Logf("testing service->backend ports")
+		currentServiceToBEPorts, err := bpfGetServiceToBackendPorts(c.GetServiceBpfId(serviceName))
+		failIfNeeded(t, []error{err}, "failed to read service to backend ports")
+		if len(with) != len(currentServiceToBEPorts) {
+			t.Fatalf("expected svc->BE  ports != current svc->BE ports %+v!=%+v", with, currentServiceToBEPorts)
+		}
+
+		for nProto, portList := range currentServiceToBEPorts {
+			comparePortList(with[protoString(nProto)], portList, false)
+		}
+
+		currentBEToServicePorts, err := bpfGetBackEndToServicePorts(c.GetServiceBpfId(serviceName))
+		failIfNeeded(t, []error{err}, "failed to read backend to service ports")
+		if len(with) != len(currentBEToServicePorts) {
+			t.Fatalf("expected BE->svc != current BE-SVC  %+v!=%+v", with, currentBEToServicePorts)
+		}
+
+		for nProto, portList := range currentBEToServicePorts {
+			comparePortList(with[protoString(nProto)], portList, true)
+		}
+	}
+
+	for round, portsByProto := range rounds {
+		errs := c.SyncServicePorts(serviceName, portsByProto)
+		failIfNeeded(t, errs, fmt.Sprintf("failed to sync ports %v", round))
+		comparePorts(portsByProto)
+	}
+}
+
+func failIfNeeded(t *testing.T, errs []error, msg string) {
+	t.Helper()
+	if len(errs) > 0 && errs[0] != nil /* we just ship err as they are here */ {
+		t.Fatalf("%v %+v", msg, errs)
 	}
 }
